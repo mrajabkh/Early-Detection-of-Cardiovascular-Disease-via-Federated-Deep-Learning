@@ -1,4 +1,4 @@
-# Early-Detection-of-Cardiovascular-Disease-in-ICU-Patients-via-Federated-Deep-Learning
+# Early-Detection-of-Cardiovascular-Disease-via-Federated-Deep-Learning
 
 Dataset used: [eICU (v2.0)](https://physionet.org/content/eicu-crd/2.0/)
 
