@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import List, Optional
 
 import pandas as pd
-import numpy as np
 
 import config
 from train_eval_gru import TrainConfig, train_and_eval
@@ -32,20 +31,12 @@ def run_sweep(
     for k in ks:
         k_name = "all" if k is None else str(int(k))
 
-        print("========================================")
+        print("#############################")
         print(f"GRU run | top_k={k_name}")
         print(f"rank_path={rank_path}")
-        print("========================================")
+        print("#############################")
 
         out = train_and_eval(disease=disease, cfg=cfg, top_k=k, rank_path=rank_path)
-
-        strat = out.get("strat_test", {})
-
-        # Debug once per run: helps catch key mismatches
-        if isinstance(strat, dict) and strat:
-            print("Stratified keys:", sorted(strat.keys()))
-        else:
-            print("Stratified keys: (empty)")
 
         row = {
             "top_k": k_name,
@@ -56,19 +47,8 @@ def run_sweep(
             "val_auprc": out["val"]["auprc"],
             "test_auroc": out["test"]["auroc"],
             "test_auprc": out["test"]["auprc"],
-            # move these after test_auprc
             "cpu_peak_mib": out["extra"]["cpu_peak_mib"],
             "runtime_sec": out["extra"]["runtime_sec"],
-            # stratified test performance
-            "test_auroc_0_2h": strat.get("auroc_0_2h", np.nan),
-            "test_auprc_0_2h": strat.get("auprc_0_2h", np.nan),
-            "test_auroc_2_6h": strat.get("auroc_2_6h", np.nan),
-            "test_auprc_2_6h": strat.get("auprc_2_6h", np.nan),
-            "test_auroc_6_12h": strat.get("auroc_6_12h", np.nan),
-            "test_auprc_6_12h": strat.get("auprc_6_12h", np.nan),
-            # optional 24h bucket (will be NaN on 12h horizon)
-            "test_auroc_12_24h": strat.get("auroc_12_24h", np.nan),
-            "test_auprc_12_24h": strat.get("auprc_12_24h", np.nan),
         }
         rows.append(row)
 
@@ -85,14 +65,6 @@ def run_sweep(
         "test_auprc",
         "cpu_peak_mib",
         "runtime_sec",
-        "test_auroc_0_2h",
-        "test_auprc_0_2h",
-        "test_auroc_2_6h",
-        "test_auprc_2_6h",
-        "test_auroc_6_12h",
-        "test_auprc_6_12h",
-        "test_auroc_12_24h",
-        "test_auprc_12_24h",
     ]
     df = df[col_order]
 
@@ -101,12 +73,12 @@ def run_sweep(
     out_path = config.gru_results_path(disease)
     df_out.to_csv(out_path, index=False)
 
-    print("========================================")
+    print("#############################")
     print("Summary:")
     print(df_out.to_string(index=False))
     print("----------------------------------------")
     print(f"Saved results CSV: {out_path}")
-    print("========================================")
+    print("#############################")
 
     return df_out
 

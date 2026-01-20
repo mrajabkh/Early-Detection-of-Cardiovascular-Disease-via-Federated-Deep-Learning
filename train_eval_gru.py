@@ -1,7 +1,7 @@
 # train_eval_gru.py
 # Train + evaluate a supervised GRU early detection model on window-sequence data.
-# Adds true lead-time stratified performance using lead_time_mins from samples.csv.
-# Also saves a PR-curve plot (precision-recall) for lead-time buckets on the TEST split.
+# Reports AUROC and AUPRC on train/val/test splits.
+# Saves ROC and PR curves for the TEST split.
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ from typing import Dict, List, Tuple
 import time
 
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -27,9 +26,9 @@ except Exception:
     memory_usage = None
 
 
-# -------------------------
+#############################
 # Metrics
-# -------------------------
+#############################
 def roc_auc_score_manual(y_true: np.ndarray, y_score: np.ndarray) -> float:
     y_true = y_true.astype(np.int64)
     y_score = y_score.astype(np.float64)
@@ -89,9 +88,6 @@ def avg_precision_score_manual(y_true: np.ndarray, y_score: np.ndarray) -> float
 
 
 def _precision_recall_curve_manual(y_true: np.ndarray, y_score: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Returns (recall, precision) arrays.
-    """
     y_true = y_true.astype(np.int64)
     y_score = y_score.astype(np.float64)
 
@@ -114,13 +110,60 @@ def _precision_recall_curve_manual(y_true: np.ndarray, y_score: np.ndarray) -> T
     return recall, precision
 
 
-def flatten_valid(logits, y, mask):
-    probs = torch.sigmoid(logits)
-    valid = mask > 0.5
-    return (
-        y[valid].detach().cpu().numpy().astype(np.int64),
-        probs[valid].detach().cpu().numpy().astype(np.float64),
-    )
+def _roc_curve_manual(y_true: np.ndarray, y_score: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Returns (fpr, tpr) arrays, including (0,0) and (1,1) endpoints.
+    """
+    y_true = y_true.astype(np.int64)
+    y_score = y_score.astype(np.float64)
+
+    n_pos = int((y_true == 1).sum())
+    n_neg = int((y_true == 0).sum())
+    if n_pos == 0 or n_neg == 0:
+        return np.array([0.0, 1.0], dtype=np.float64), np.array([0.0, 1.0], dtype=np.float64)
+
+    order = np.argsort(-y_score)
+    y_sorted = y_true[order]
+
+    tp = np.cumsum(y_sorted == 1)
+    fp = np.cumsum(y_sorted == 0)
+
+    tpr = tp / float(n_pos)
+    fpr = fp / float(n_neg)
+
+    # add endpoints
+    fpr = np.concatenate([np.array([0.0]), fpr, np.array([1.0])])
+    tpr = np.concatenate([np.array([0.0]), tpr, np.array([1.0])])
+
+    return fpr, tpr
+
+
+def _flatten_loader_probs(model, loader, device) -> Tuple[np.ndarray, np.ndarray]:
+    model.eval()
+    all_y: List[np.ndarray] = []
+    all_p: List[np.ndarray] = []
+
+    with torch.no_grad():
+        for x, y, mask, lengths in loader:
+            x = x.to(device)
+            y = y.to(device)
+            mask = mask.to(device)
+
+            logits = model(x, lengths)
+            probs = torch.sigmoid(logits)
+            valid = mask > 0.5
+
+            yt = y[valid].detach().cpu().numpy().astype(np.int64)
+            pt = probs[valid].detach().cpu().numpy().astype(np.float64)
+
+            if yt.size > 0:
+                all_y.append(yt)
+                all_p.append(pt)
+
+    if not all_y:
+        return np.array([], dtype=np.int64), np.array([], dtype=np.float64)
+
+    return np.concatenate(all_y), np.concatenate(all_p)
 
 
 def masked_bce(logits, targets, mask, pos_weight=None):
@@ -130,9 +173,9 @@ def masked_bce(logits, targets, mask, pos_weight=None):
     return loss.sum() / mask.sum().clamp_min(1.0)
 
 
-# -------------------------
+#############################
 # Config
-# -------------------------
+#############################
 @dataclass
 class TrainConfig:
     max_len: int = 128
@@ -148,9 +191,9 @@ class TrainConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-# -------------------------
+#############################
 # Eval
-# -------------------------
+#############################
 @torch.no_grad()
 def evaluate(model, loader, device):
     model.eval()
@@ -166,8 +209,12 @@ def evaluate(model, loader, device):
         loss = masked_bce(logits, y, mask)
         total_loss += float(loss.item())
 
-        yt, ys = flatten_valid(logits, y, mask)
-        if len(yt):
+        probs = torch.sigmoid(logits)
+        valid = mask > 0.5
+        yt = y[valid].detach().cpu().numpy().astype(np.int64)
+        ys = probs[valid].detach().cpu().numpy().astype(np.float64)
+
+        if yt.size:
             all_y.append(yt)
             all_s.append(ys)
 
@@ -184,140 +231,64 @@ def evaluate(model, loader, device):
     }
 
 
-def _get_leadtime_buckets() -> Dict[str, Tuple[int, int]]:
-    """
-    Choose lead-time buckets based on the configured horizon.
-    - For 12h horizon: 3 buckets (0-2, 2-6, 6-12)
-    - For 24h (or larger) horizon: 4 buckets (0-2, 2-6, 6-12, 12-24)
-    This prevents errors if you switch config back and forth.
-    """
-    hor_hrs = int(getattr(config, "HORIZON_HRS", 12))
-
-    if hor_hrs >= 24:
-        return {
-            "0_2h": (0, 120),
-            "2_6h": (120, 360),
-            "6_12h": (360, 720),
-            "12_24h": (720, 1440),
-        }
-
-    # default: 12h-style buckets
-    return {
-        "0_2h": (0, 120),
-        "2_6h": (120, 360),
-        "6_12h": (360, 720),
-    }
-
-
-@torch.no_grad()
-def evaluate_stratified_lead_time(
+def _save_test_curves(
     model,
-    dataset: PatientSequenceDataset,
-    device: str,
+    test_loader,
     disease: config.DiseaseSpec,
     top_k: int | None,
-) -> Tuple[Dict[str, float], str | None]:
+    device: str,
+) -> Dict[str, str | None]:
     """
-    True lead-time stratification using lead_time_mins from samples.csv.
-
-    For a given bucket, evaluate ONLY windows whose lead_time_mins is in the bucket.
-    This avoids inflating metrics by mixing in "easy negatives" from other lead times.
-
-    Also saves a PR curve plot for the buckets into:
-      Outputs/<run_name>/PR_Plots/
+    Save ROC and PR plots for TEST split.
     """
-    model.eval()
+    out_dir = config.run_dir(disease)
 
-    buckets = _get_leadtime_buckets()
+    curves_dir = out_dir / "Curves"
+    curves_dir.mkdir(parents=True, exist_ok=True)
 
-    metrics_out: Dict[str, float] = {}
-    plot_data: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+    topk_tag = "all" if top_k is None else str(int(top_k))
 
-    for bname, (lo, hi) in buckets.items():
-        y_all: List[int] = []
-        s_all: List[float] = []
+    y_true, y_prob = _flatten_loader_probs(model, test_loader, device=device)
+    if y_true.size == 0:
+        return {"roc_path": None, "pr_path": None}
 
-        for i in range(len(dataset)):
-            idx = dataset._groups[i]
-            sub = dataset.df.iloc[idx]
+    roc_path = str(curves_dir / f"roc_test__topk{topk_tag}.png")
+    pr_path = str(curves_dir / f"pr_test__topk{topk_tag}.png")
 
-            x = sub[dataset.feature_cols].to_numpy(dtype=np.float32)
-            y = sub["label"].to_numpy(dtype=np.int64)
+    #############################
+    # ROC
+    #############################
+    fpr, tpr = _roc_curve_manual(y_true, y_prob)
 
-            if "lead_time_mins" in sub.columns:
-                lt = pd.to_numeric(sub["lead_time_mins"], errors="coerce").to_numpy(dtype=np.float32)
-            else:
-                lt = np.full(len(y), np.nan, dtype=np.float32)
+    plt.figure()
+    plt.plot(fpr, tpr)
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title(f"ROC curve (TEST, top_k={topk_tag})")
+    plt.tight_layout()
+    plt.savefig(roc_path, dpi=200)
+    plt.close()
 
-            if len(y) > dataset.max_len:
-                x = x[-dataset.max_len :]
-                y = y[-dataset.max_len :]
-                lt = lt[-dataset.max_len :]
+    #############################
+    # PR
+    #############################
+    recall, precision = _precision_recall_curve_manual(y_true, y_prob)
 
-            if len(y) == 0:
-                continue
+    plt.figure()
+    plt.plot(recall, precision)
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.title(f"PR curve (TEST, top_k={topk_tag})")
+    plt.tight_layout()
+    plt.savefig(pr_path, dpi=200)
+    plt.close()
 
-            # Keep only windows in this lead-time bucket
-            keep = np.isfinite(lt) & (lt >= lo) & (lt < hi)
-            if not np.any(keep):
-                continue
-
-            xt = torch.from_numpy(x[None, :, :]).to(device)
-            lengths = torch.tensor([len(y)], dtype=torch.long, device=device)
-
-            logits = model(xt, lengths)
-            probs = torch.sigmoid(logits).detach().cpu().numpy().reshape(-1)
-
-            y_all.extend(y[keep].tolist())
-            s_all.extend(probs[keep].tolist())
-
-        if len(y_all) == 0:
-            metrics_out[f"auroc_{bname}"] = float("nan")
-            metrics_out[f"auprc_{bname}"] = float("nan")
-            plot_data[bname] = (np.array([], dtype=np.int64), np.array([], dtype=np.float64))
-            continue
-
-        y_true = np.array(y_all, dtype=np.int64)
-        y_score = np.array(s_all, dtype=np.float64)
-
-        metrics_out[f"auroc_{bname}"] = roc_auc_score_manual(y_true, y_score)
-        metrics_out[f"auprc_{bname}"] = avg_precision_score_manual(y_true, y_score)
-        plot_data[bname] = (y_true, y_score)
-
-    plot_path: str | None = None
-    try:
-        out_dir = config.run_dir(disease)
-
-        PR_Plots_dir = out_dir / "PR_Plots"
-        PR_Plots_dir.mkdir(parents=True, exist_ok=True)
-
-        topk_tag = "all" if top_k is None else str(int(top_k))
-        plot_path = str(PR_Plots_dir / f"gru_pr_by_leadtime__topk{topk_tag}.png")
-
-        plt.figure()
-        for bname in buckets.keys():
-            y_true, y_score = plot_data.get(bname, (np.array([], dtype=np.int64), np.array([], dtype=np.float64)))
-            if y_true.size == 0:
-                continue
-            recall, precision = _precision_recall_curve_manual(y_true, y_score)
-            plt.plot(recall, precision, label=bname)
-
-        plt.xlabel("Recall")
-        plt.ylabel("Precision")
-        plt.title(f"PR curves by lead-time bucket (top_k={topk_tag})")
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(plot_path, dpi=200)
-        plt.close()
-    except Exception:
-        plot_path = None
-
-    return metrics_out, plot_path
+    return {"roc_path": roc_path, "pr_path": pr_path}
 
 
-# -------------------------
+#############################
 # Train + Eval
-# -------------------------
+#############################
 def train_and_eval(
     disease: config.DiseaseSpec,
     cfg: TrainConfig,
@@ -401,21 +372,20 @@ def train_and_eval(
         val_metrics = evaluate(model, val_loader, cfg.device)
         test_metrics = evaluate(model, test_loader, cfg.device)
 
-        strat_test, pr_plot_path = evaluate_stratified_lead_time(
+        curve_paths = _save_test_curves(
             model=model,
-            dataset=test_ds,
-            device=cfg.device,
+            test_loader=test_loader,
             disease=disease,
             top_k=top_k,
+            device=cfg.device,
         )
 
         return {
             "train": train_metrics,
             "val": val_metrics,
             "test": test_metrics,
-            "strat_test": strat_test,
             "n_features": len(train_ds.feature_cols),
-            "pr_plot_path": pr_plot_path,
+            "curve_paths": curve_paths,
         }
 
     if memory_usage is not None:
@@ -431,7 +401,8 @@ def train_and_eval(
         "runtime_sec": runtime,
         "cpu_peak_mib": cpu_peak,
         "n_features": out["n_features"],
-        "pr_plot_path": out.get("pr_plot_path", None),
+        "roc_path": out.get("curve_paths", {}).get("roc_path", None),
+        "pr_path": out.get("curve_paths", {}).get("pr_path", None),
     }
 
     return out
