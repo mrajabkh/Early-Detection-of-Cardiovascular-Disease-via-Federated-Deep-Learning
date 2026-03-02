@@ -7,6 +7,18 @@
 # - Uses pos_weight in BCEWithLogitsLoss during TRAINING to handle class imbalance.
 # - pos_weight computed from TRAIN split masked labels: n_neg / n_pos
 # - Optional clipping via config.POS_WEIGHT_MAX (if not present, no clipping).
+#
+# NEW (metrics parity with ML table, but only for TEST):
+# - Selects a classification threshold on the VALIDATION split by maximizing F1.
+# - Applies that fixed threshold to TEST to compute: Accuracy, Precision, Recall, F1,
+#   confusion matrix (TN/FP/FN/TP) and FPR.
+# - Keeps train/val AUROC/AUPRC available internally, but you can choose what to log.
+#
+# NEW (focal loss option):
+# - Adds masked focal loss (logits version) to focus training on hard examples.
+# - Training uses focal loss by default here (pos_weight disabled for focal).
+# - Eval loss still uses BCE (ranking metrics unchanged). You can switch eval loss
+#   to focal too if you want, but it doesn't affect AUROC/AUPRC.
 
 from __future__ import annotations
 
@@ -170,12 +182,130 @@ def _flatten_loader_probs(model, loader, device) -> Tuple[np.ndarray, np.ndarray
     return np.concatenate(all_y), np.concatenate(all_p)
 
 
+def _pick_threshold_max_f1(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    """
+    Choose threshold that maximizes F1 on (y_true, y_prob).
+    Returns t such that y_pred = (y_prob >= t).
+    """
+    y_true = y_true.astype(np.int64)
+    y_prob = y_prob.astype(np.float64)
+
+    n_pos = int((y_true == 1).sum())
+    if n_pos == 0:
+        return 0.5
+
+    order = np.argsort(-y_prob)
+    y_sorted = y_true[order]
+    p_sorted = y_prob[order]
+
+    tp = np.cumsum(y_sorted == 1)
+    fp = np.cumsum(y_sorted == 0)
+
+    precision = tp / np.maximum(tp + fp, 1)
+    recall = tp / float(n_pos)
+
+    denom = precision + recall
+    f1 = np.where(denom > 0, 2.0 * precision * recall / denom, 0.0)
+
+    best_idx = int(np.argmax(f1))
+    best_t = float(p_sorted[best_idx])
+
+    if best_t < 0.0:
+        best_t = 0.0
+    if best_t > 1.0:
+        best_t = 1.0
+
+    return best_t
+
+
+def _threshold_metrics(y_true: np.ndarray, y_prob: np.ndarray, threshold: float) -> Dict[str, float]:
+    """
+    Compute threshold-based metrics + confusion matrix + FPR.
+    """
+    y_true = y_true.astype(np.int64)
+    y_prob = y_prob.astype(np.float64)
+    thr = float(threshold)
+
+    y_pred = (y_prob >= thr).astype(np.int64)
+
+    tp = int(((y_true == 1) & (y_pred == 1)).sum())
+    tn = int(((y_true == 0) & (y_pred == 0)).sum())
+    fp = int(((y_true == 0) & (y_pred == 1)).sum())
+    fn = int(((y_true == 1) & (y_pred == 0)).sum())
+
+    acc = (tp + tn) / max(tp + tn + fp + fn, 1)
+
+    prec = tp / max(tp + fp, 1)
+    rec = tp / max(tp + fn, 1)
+
+    denom = prec + rec
+    f1 = (2.0 * prec * rec / denom) if denom > 0 else 0.0
+
+    fpr = fp / max(fp + tn, 1)
+
+    return {
+        "accuracy": float(acc),
+        "precision": float(prec),
+        "recall": float(rec),
+        "f1": float(f1),
+        "fpr": float(fpr),
+        "tn": float(tn),
+        "fp": float(fp),
+        "fn": float(fn),
+        "tp": float(tp),
+        "threshold": float(thr),
+    }
+
+
 #############################
 # Loss
 #############################
 def masked_bce(logits, targets, mask, pos_weight=None):
     loss_fn = nn.BCEWithLogitsLoss(reduction="none", pos_weight=pos_weight)
     loss = loss_fn(logits, targets.float())
+    loss = loss * mask.float()
+    return loss.sum() / mask.sum().clamp_min(1.0)
+
+
+def masked_focal_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+    gamma: float = 2.0,
+    alpha: float | None = None,
+    pos_weight: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    Focal loss for binary classification using logits, with timestep masking.
+
+    - gamma: focusing parameter (2.0 is common)
+    - alpha: optional class balance factor:
+        * if alpha is not None: alpha for positives, (1-alpha) for negatives
+    - pos_weight: optional (like BCEWithLogitsLoss pos_weight). Suggest starting with None
+      when using focal, then later try a damped pos_weight if needed.
+    """
+    bce = nn.functional.binary_cross_entropy_with_logits(
+        logits,
+        targets.float(),
+        reduction="none",
+        pos_weight=pos_weight,
+    )
+
+    p = torch.sigmoid(logits)
+    pt = torch.where(targets > 0.5, p, 1.0 - p)
+
+    focal_factor = (1.0 - pt).clamp_min(0.0).pow(gamma)
+    loss = focal_factor * bce
+
+    if alpha is not None:
+        a = float(alpha)
+        alpha_t = torch.where(
+            targets > 0.5,
+            torch.tensor(a, device=logits.device, dtype=loss.dtype),
+            torch.tensor(1.0 - a, device=logits.device, dtype=loss.dtype),
+        )
+        loss = alpha_t * loss
+
     loss = loss * mask.float()
     return loss.sum() / mask.sum().clamp_min(1.0)
 
@@ -206,7 +336,6 @@ def _compute_pos_weight_from_loader(train_loader: DataLoader, device: str) -> to
 
     pw = float(n_neg) / float(n_pos)
 
-    # Clip only if user defines a max in config
     if hasattr(config, "POS_WEIGHT_MAX") and config.POS_WEIGHT_MAX is not None:
         pw_max = float(config.POS_WEIGHT_MAX)
         pw = float(np.clip(pw, 1.0, pw_max))
@@ -247,7 +376,7 @@ def evaluate(model, loader, device):
         mask = mask.to(device)
 
         logits = model(x, lengths)
-        loss = masked_bce(logits, y, mask)
+        loss = masked_bce(logits, y, mask)  # keep BCE for reporting
         total_loss += float(loss.item())
 
         probs = torch.sigmoid(logits)
@@ -394,6 +523,7 @@ def train_and_eval(
 
         #############################
         # pos_weight (TRAIN only)
+        # NOTE: For focal loss, start with pos_weight disabled (None). We'll ablate later if needed.
         #############################
         use_pos_weight = True
         if hasattr(config, "USE_POS_WEIGHT"):
@@ -426,7 +556,17 @@ def train_and_eval(
                 mask = mask.to(cfg.device)
 
                 optimizer.zero_grad()
-                loss = masked_bce(model(x, lengths), y, mask, pos_weight=pos_weight)
+
+                # FOCAL LOSS (default)
+                loss = masked_focal_loss(
+                    model(x, lengths),
+                    y,
+                    mask,
+                    gamma=2.0,
+                    alpha=None,
+                    pos_weight=None,
+                )
+
                 loss.backward()
                 optimizer.step()
 
@@ -443,9 +583,41 @@ def train_and_eval(
         if best_state is not None:
             model.load_state_dict(best_state)
 
+        # Compute baseline metrics (AUROC/AUPRC) for splits
         train_metrics = evaluate(model, train_loader, cfg.device)
         val_metrics = evaluate(model, val_loader, cfg.device)
         test_metrics = evaluate(model, test_loader, cfg.device)
+
+        # ----------------------------
+        # Choose threshold on VAL to maximize F1 (NO TEST LEAKAGE)
+        # ----------------------------
+        yv_true, yv_prob = _flatten_loader_probs(model, val_loader, device=cfg.device)
+        if yv_true.size == 0:
+            chosen_threshold = 0.5
+        else:
+            chosen_threshold = _pick_threshold_max_f1(yv_true, yv_prob)
+
+        # ----------------------------
+        # Add threshold-based metrics ONLY for TEST (as requested)
+        # ----------------------------
+        yt_true, yt_prob = _flatten_loader_probs(model, test_loader, device=cfg.device)
+        if yt_true.size == 0:
+            test_metrics.update(
+                {
+                    "accuracy": float("nan"),
+                    "precision": float("nan"),
+                    "recall": float("nan"),
+                    "f1": float("nan"),
+                    "fpr": float("nan"),
+                    "tn": float("nan"),
+                    "fp": float("nan"),
+                    "fn": float("nan"),
+                    "tp": float("nan"),
+                    "threshold": float(chosen_threshold),
+                }
+            )
+        else:
+            test_metrics.update(_threshold_metrics(yt_true, yt_prob, chosen_threshold))
 
         curve_paths = _save_test_curves(
             model=model,
@@ -459,6 +631,7 @@ def train_and_eval(
             "train": train_metrics,
             "val": val_metrics,
             "test": test_metrics,
+            "threshold": float(chosen_threshold),
             "n_features": len(train_ds.feature_cols),
             "curve_paths": curve_paths,
             "pos_weight": (float(pos_weight.item()) if pos_weight is not None else None),
@@ -480,6 +653,7 @@ def train_and_eval(
         "roc_path": out.get("curve_paths", {}).get("roc_path", None),
         "pr_path": out.get("curve_paths", {}).get("pr_path", None),
         "pos_weight": out.get("pos_weight", None),
+        "threshold": out.get("threshold", None),
     }
 
     return out

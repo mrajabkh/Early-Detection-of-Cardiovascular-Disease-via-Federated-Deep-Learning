@@ -1,5 +1,5 @@
 # gru_risk.py
-# Simple supervised GRU for early detection on windowed time series
+# GRU-based risk predictor with optional LayerNorm on GRU outputs
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ class GRURisk(nn.Module):
         hidden_dim: int = 128,
         num_layers: int = 1,
         dropout: float = 0.2,
+        use_layernorm: bool = True,  # NEW
     ) -> None:
         super().__init__()
 
@@ -31,6 +32,12 @@ class GRURisk(nn.Module):
             dropout=0.0 if num_layers == 1 else dropout,
             bidirectional=False,
         )
+
+        self.use_layernorm = use_layernorm
+
+        if self.use_layernorm:
+            # Normalize across hidden dimension
+            self.layernorm = nn.LayerNorm(hidden_dim)
 
         self.dropout = nn.Dropout(dropout)
         self.head = nn.Linear(hidden_dim, 1)
@@ -55,7 +62,6 @@ class GRURisk(nn.Module):
           logits: (B, T)
         """
         if lengths is not None:
-            # Pack sequences for efficiency
             packed = nn.utils.rnn.pack_padded_sequence(
                 x,
                 lengths.cpu(),
@@ -70,6 +76,11 @@ class GRURisk(nn.Module):
         else:
             out, _ = self.gru(x)
 
+        # Apply LayerNorm to GRU outputs
+        if self.use_layernorm:
+            out = self.layernorm(out)
+
         out = self.dropout(out)
         logits = self.head(out).squeeze(-1)  # (B, T)
+
         return logits

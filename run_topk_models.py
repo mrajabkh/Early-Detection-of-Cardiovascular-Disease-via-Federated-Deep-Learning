@@ -4,12 +4,14 @@
 # Ranking: stability_combined only (no SHAP fallback).
 # Optional: peak RAM via memory_profiler if installed.
 #
+# NOTE (quick hack): Only outputs TEST split rows (no VAL/TRAIN rows written).
+#
 # Location: Project/Code/run_topk_models.py
 
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -150,7 +152,9 @@ def load_feature_ranking(valid_feature_names: List[str]) -> List[str]:
     feature_set = set(valid_feature_names)
 
     if not bool(getattr(config, "USE_STABILITY_RANKING", True)):
-        raise RuntimeError("USE_STABILITY_RANKING is False, but this script only supports stability_combined ranking.")
+        raise RuntimeError(
+            "USE_STABILITY_RANKING is False, but this script only supports stability_combined ranking."
+        )
 
     stab_path = config.stability_combined_path(config.DISEASE)
     if not stab_path.exists():
@@ -244,11 +248,13 @@ def _get_feature_columns(merged: pd.DataFrame) -> List[str]:
 def _build_split_arrays(
     merged: pd.DataFrame,
     feat_cols: List[str],
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[str]]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[str]]:
     train_df = merged[merged["split"] == "train"].copy()
     val_df = merged[merged["split"] == "val"].copy()
     test_df = merged[merged["split"] == "test"].copy()
 
+    # Quick hack: still requires val to exist because we reuse the existing pipeline,
+    # but we won't evaluate on val or output val rows.
     if train_df.empty or val_df.empty or test_df.empty:
         raise RuntimeError("One of train/val/test is empty. Check your samples.csv splits.")
 
@@ -286,7 +292,13 @@ def _build_split_arrays(
     X_val_scl = scaler.transform(X_val_imp).astype(np.float32, copy=False)
     X_test_scl = scaler.transform(X_test_imp).astype(np.float32, copy=False)
 
-    return X_train_imp, y_train, X_val_imp, y_val, X_test_imp, y_test, X_train_scl, X_val_scl, X_test_scl, feat_cols
+    return (
+        X_train_imp, y_train,
+        X_val_imp, y_val,
+        X_test_imp, y_test,
+        X_train_scl, X_val_scl, X_test_scl,
+        feat_cols,
+    )
 
 
 def _make_feature_index_map(feature_names: List[str]) -> Dict[str, int]:
@@ -429,40 +441,19 @@ def main() -> None:
 
         # Slice arrays
         Xtr_imp_k = X_train_imp[:, top_k_indices]
-        Xva_imp_k = X_val_imp[:, top_k_indices]
         Xte_imp_k = X_test_imp[:, top_k_indices]
 
         Xtr_scl_k = X_train_scl[:, top_k_indices]
-        Xva_scl_k = X_val_scl[:, top_k_indices]
         Xte_scl_k = X_test_scl[:, top_k_indices]
 
         print("#############################")
         print(f"Top-K = {K}")
-        print(f"Train (imp): {Xtr_imp_k.shape}, Val (imp): {Xva_imp_k.shape}, Test (imp): {Xte_imp_k.shape}")
-        print(f"Train (scl): {Xtr_scl_k.shape}, Val (scl): {Xva_scl_k.shape}, Test (scl): {Xte_scl_k.shape}")
+        print(f"Train (imp): {Xtr_imp_k.shape}, Test (imp): {Xte_imp_k.shape}")
+        print(f"Train (scl): {Xtr_scl_k.shape}, Test (scl): {Xte_scl_k.shape}")
         print("#############################")
 
-        # Evaluate each model on BOTH val and test (so you can compare like GRU sweep)
+        # Evaluate each model ONLY on TEST (train is used only for fitting)
         for name, model in models_scaled.items():
-            # VAL
-            full_name_val = f"{name} (top-{K})"
-            print(f"Running (VAL): {full_name_val}")
-            metrics_val = evaluate_with_peak_ram(
-                model=model,
-                X_train=Xtr_scl_k,
-                X_eval=Xva_scl_k,
-                y_train=y_train,
-                y_eval=y_val,
-                interval_sec=0.1,
-            )
-            all_results.append({
-                "Model": full_name_val,
-                "TopK": K,
-                "Split": "val",
-                **metrics_val,
-            })
-
-            # TEST
             full_name_test = f"{name} (top-{K})"
             print(f"Running (TEST): {full_name_test}")
             metrics_test = evaluate_with_peak_ram(
@@ -473,33 +464,16 @@ def main() -> None:
                 y_eval=y_test,
                 interval_sec=0.1,
             )
-            all_results.append({
-                "Model": full_name_test,
-                "TopK": K,
-                "Split": "test",
-                **metrics_test,
-            })
+            all_results.append(
+                {
+                    "Model": full_name_test,
+                    "TopK": K,
+                    "Split": "test",
+                    **metrics_test,
+                }
+            )
 
         for name, model in models_imputed.items():
-            # VAL
-            full_name_val = f"{name} (top-{K})"
-            print(f"Running (VAL): {full_name_val}")
-            metrics_val = evaluate_with_peak_ram(
-                model=model,
-                X_train=Xtr_imp_k,
-                X_eval=Xva_imp_k,
-                y_train=y_train,
-                y_eval=y_val,
-                interval_sec=0.1,
-            )
-            all_results.append({
-                "Model": full_name_val,
-                "TopK": K,
-                "Split": "val",
-                **metrics_val,
-            })
-
-            # TEST
             full_name_test = f"{name} (top-{K})"
             print(f"Running (TEST): {full_name_test}")
             metrics_test = evaluate_with_peak_ram(
@@ -510,17 +484,19 @@ def main() -> None:
                 y_eval=y_test,
                 interval_sec=0.1,
             )
-            all_results.append({
-                "Model": full_name_test,
-                "TopK": K,
-                "Split": "test",
-                **metrics_test,
-            })
+            all_results.append(
+                {
+                    "Model": full_name_test,
+                    "TopK": K,
+                    "Split": "test",
+                    **metrics_test,
+                }
+            )
 
     results_df = pd.DataFrame(all_results)
 
-    # Sort: TopK then Split then AUROC desc
-    results_df = results_df.sort_values(by=["TopK", "Split", "AUROC"], ascending=[True, True, False])
+    # Sort: TopK then AUROC desc (Split is always test now)
+    results_df = results_df.sort_values(by=["TopK", "AUROC"], ascending=[True, False])
 
     # Round numeric metrics to 3 d.p. (keep confusion matrix counts as ints)
     float_cols = results_df.select_dtypes(include=[np.number]).columns.tolist()
