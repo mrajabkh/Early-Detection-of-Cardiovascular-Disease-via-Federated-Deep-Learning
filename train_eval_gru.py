@@ -12,13 +12,14 @@
 # - Selects a classification threshold on the VALIDATION split by maximizing F1.
 # - Applies that fixed threshold to TEST to compute: Accuracy, Precision, Recall, F1,
 #   confusion matrix (TN/FP/FN/TP) and FPR.
-# - Keeps train/val AUROC/AUPRC available internally, but you can choose what to log.
 #
-# NEW (focal loss option):
-# - Adds masked focal loss (logits version) to focus training on hard examples.
-# - Training uses focal loss by default here (pos_weight disabled for focal).
-# - Eval loss still uses BCE (ranking metrics unchanged). You can switch eval loss
-#   to focal too if you want, but it doesn't affect AUROC/AUPRC.
+# NEW (focal loss):
+# - Training uses masked focal loss on per-timestep logits.
+#
+# NEW (attention pooling aux head):
+# - Model may return dict containing logits_ts and optional logit_seq.
+# - If logit_seq exists, we can add an auxiliary sequence-level loss.
+#   This gives you attention weights for XAI later without changing evaluation.
 
 from __future__ import annotations
 
@@ -41,6 +42,14 @@ try:
     from memory_profiler import memory_usage
 except Exception:
     memory_usage = None
+
+
+#############################
+# Attention aux loss config
+#############################
+# Keep small so it doesn't hijack training
+ATTN_AUX_ENABLED = True
+ATTN_AUX_WEIGHT = 0.1
 
 
 #############################
@@ -128,9 +137,6 @@ def _precision_recall_curve_manual(y_true: np.ndarray, y_score: np.ndarray) -> T
 
 
 def _roc_curve_manual(y_true: np.ndarray, y_score: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Returns (fpr, tpr) arrays, including (0,0) and (1,1) endpoints.
-    """
     y_true = y_true.astype(np.int64)
     y_score = y_score.astype(np.float64)
 
@@ -154,6 +160,19 @@ def _roc_curve_manual(y_true: np.ndarray, y_score: np.ndarray) -> Tuple[np.ndarr
     return fpr, tpr
 
 
+def _model_forward_logits_ts(model_out) -> torch.Tensor:
+    # Support dict output
+    if isinstance(model_out, dict):
+        return model_out["logits_ts"]
+    return model_out
+
+
+def _model_forward_logit_seq(model_out) -> torch.Tensor | None:
+    if isinstance(model_out, dict):
+        return model_out.get("logit_seq", None)
+    return None
+
+
 def _flatten_loader_probs(model, loader, device) -> Tuple[np.ndarray, np.ndarray]:
     model.eval()
     all_y: List[np.ndarray] = []
@@ -165,7 +184,9 @@ def _flatten_loader_probs(model, loader, device) -> Tuple[np.ndarray, np.ndarray
             y = y.to(device)
             mask = mask.to(device)
 
-            logits = model(x, lengths)
+            out = model(x, lengths)
+            logits = _model_forward_logits_ts(out)
+
             probs = torch.sigmoid(logits)
             valid = mask > 0.5
 
@@ -183,10 +204,6 @@ def _flatten_loader_probs(model, loader, device) -> Tuple[np.ndarray, np.ndarray
 
 
 def _pick_threshold_max_f1(y_true: np.ndarray, y_prob: np.ndarray) -> float:
-    """
-    Choose threshold that maximizes F1 on (y_true, y_prob).
-    Returns t such that y_pred = (y_prob >= t).
-    """
     y_true = y_true.astype(np.int64)
     y_prob = y_prob.astype(np.float64)
 
@@ -219,9 +236,6 @@ def _pick_threshold_max_f1(y_true: np.ndarray, y_prob: np.ndarray) -> float:
 
 
 def _threshold_metrics(y_true: np.ndarray, y_prob: np.ndarray, threshold: float) -> Dict[str, float]:
-    """
-    Compute threshold-based metrics + confusion matrix + FPR.
-    """
     y_true = y_true.astype(np.int64)
     y_prob = y_prob.astype(np.float64)
     thr = float(threshold)
@@ -275,15 +289,6 @@ def masked_focal_loss(
     alpha: float | None = None,
     pos_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """
-    Focal loss for binary classification using logits, with timestep masking.
-
-    - gamma: focusing parameter (2.0 is common)
-    - alpha: optional class balance factor:
-        * if alpha is not None: alpha for positives, (1-alpha) for negatives
-    - pos_weight: optional (like BCEWithLogitsLoss pos_weight). Suggest starting with None
-      when using focal, then later try a damped pos_weight if needed.
-    """
     bce = nn.functional.binary_cross_entropy_with_logits(
         logits,
         targets.float(),
@@ -310,12 +315,20 @@ def masked_focal_loss(
     return loss.sum() / mask.sum().clamp_min(1.0)
 
 
+def _compute_seq_targets(y: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """
+    Create a sequence-level label per patient: 1 if ANY valid timestep is positive else 0.
+    y: (B, T) int/long
+    mask: (B, T) float
+    returns y_seq: (B,) float
+    """
+    valid = mask > 0.5
+    y_pos = (y > 0.5) & valid
+    y_seq = y_pos.any(dim=1).float()
+    return y_seq
+
+
 def _compute_pos_weight_from_loader(train_loader: DataLoader, device: str) -> torch.Tensor | None:
-    """
-    Compute pos_weight = n_neg / n_pos from TRAIN masked labels.
-    Optional clipping: if config.POS_WEIGHT_MAX exists, clip to that max.
-    If no positives found, returns None.
-    """
     n_pos = 0
     n_neg = 0
 
@@ -375,8 +388,10 @@ def evaluate(model, loader, device):
         y = y.to(device)
         mask = mask.to(device)
 
-        logits = model(x, lengths)
-        loss = masked_bce(logits, y, mask)  # keep BCE for reporting
+        out = model(x, lengths)
+        logits = _model_forward_logits_ts(out)
+
+        loss = masked_bce(logits, y, mask)
         total_loss += float(loss.item())
 
         probs = torch.sigmoid(logits)
@@ -419,9 +434,6 @@ def _save_test_curves(
     top_k: int | None,
     device: str,
 ) -> Dict[str, str | None]:
-    """
-    Save ROC and PR plots for TEST split.
-    """
     out_dir = config.run_dir(disease)
 
     curves_dir = out_dir / "Curves"
@@ -436,11 +448,7 @@ def _save_test_curves(
     roc_path = str(curves_dir / f"roc_test__topk{topk_tag}.png")
     pr_path = str(curves_dir / f"pr_test__topk{topk_tag}.png")
 
-    #############################
-    # ROC
-    #############################
     fpr, tpr = _roc_curve_manual(y_true, y_prob)
-
     plt.figure()
     plt.plot(fpr, tpr)
     plt.xlabel("False Positive Rate")
@@ -450,11 +458,7 @@ def _save_test_curves(
     plt.savefig(roc_path, dpi=200)
     plt.close()
 
-    #############################
-    # PR
-    #############################
     recall, precision = _precision_recall_curve_manual(y_true, y_prob)
-
     plt.figure()
     plt.plot(recall, precision)
     plt.xlabel("Recall")
@@ -517,32 +521,11 @@ def train_and_eval(
             hidden_dim=cfg.hidden_dim,
             num_layers=cfg.num_layers,
             dropout=cfg.dropout,
+            use_layernorm=True,
+            use_attention_pooling=True,
         ).to(cfg.device)
 
         optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-
-        #############################
-        # pos_weight (TRAIN only)
-        # NOTE: For focal loss, start with pos_weight disabled (None). We'll ablate later if needed.
-        #############################
-        use_pos_weight = True
-        if hasattr(config, "USE_POS_WEIGHT"):
-            use_pos_weight = bool(config.USE_POS_WEIGHT)
-
-        pos_weight = None
-        if use_pos_weight:
-            pos_weight = _compute_pos_weight_from_loader(train_loader, device=cfg.device)
-
-            print("#############################")
-            print("Pos weight configuration")
-            print(f"USE_POS_WEIGHT: {use_pos_weight}")
-            if pos_weight is None:
-                print("pos_weight: None (no positives found in train masked labels)")
-            else:
-                print(f"pos_weight: {float(pos_weight.item()):.6f}")
-                if hasattr(config, "POS_WEIGHT_MAX") and config.POS_WEIGHT_MAX is not None:
-                    print(f"POS_WEIGHT_MAX: {float(config.POS_WEIGHT_MAX):.6f}")
-            print("#############################")
 
         best_val = -1.0
         best_state = None
@@ -557,15 +540,33 @@ def train_and_eval(
 
                 optimizer.zero_grad()
 
-                # FOCAL LOSS (default)
-                loss = masked_focal_loss(
-                    model(x, lengths),
+                out = model(x, lengths)
+                logits_ts = _model_forward_logits_ts(out)
+
+                # Main per-timestep focal loss
+                loss_ts = masked_focal_loss(
+                    logits_ts,
                     y,
                     mask,
                     gamma=2.0,
                     alpha=None,
                     pos_weight=None,
                 )
+
+                loss = loss_ts
+
+                # Optional aux sequence loss (attention pooling head)
+                if ATTN_AUX_ENABLED:
+                    logit_seq = _model_forward_logit_seq(out)
+                    if logit_seq is not None:
+                        y_seq = _compute_seq_targets(y, mask)  # (B,)
+                        # Use BCE for sequence aux head (simple + stable)
+                        loss_seq = nn.functional.binary_cross_entropy_with_logits(
+                            logit_seq,
+                            y_seq,
+                            reduction="mean",
+                        )
+                        loss = loss + float(ATTN_AUX_WEIGHT) * loss_seq
 
                 loss.backward()
                 optimizer.step()
@@ -583,23 +584,13 @@ def train_and_eval(
         if best_state is not None:
             model.load_state_dict(best_state)
 
-        # Compute baseline metrics (AUROC/AUPRC) for splits
         train_metrics = evaluate(model, train_loader, cfg.device)
         val_metrics = evaluate(model, val_loader, cfg.device)
         test_metrics = evaluate(model, test_loader, cfg.device)
 
-        # ----------------------------
-        # Choose threshold on VAL to maximize F1 (NO TEST LEAKAGE)
-        # ----------------------------
         yv_true, yv_prob = _flatten_loader_probs(model, val_loader, device=cfg.device)
-        if yv_true.size == 0:
-            chosen_threshold = 0.5
-        else:
-            chosen_threshold = _pick_threshold_max_f1(yv_true, yv_prob)
+        chosen_threshold = 0.5 if yv_true.size == 0 else _pick_threshold_max_f1(yv_true, yv_prob)
 
-        # ----------------------------
-        # Add threshold-based metrics ONLY for TEST (as requested)
-        # ----------------------------
         yt_true, yt_prob = _flatten_loader_probs(model, test_loader, device=cfg.device)
         if yt_true.size == 0:
             test_metrics.update(
@@ -634,7 +625,7 @@ def train_and_eval(
             "threshold": float(chosen_threshold),
             "n_features": len(train_ds.feature_cols),
             "curve_paths": curve_paths,
-            "pos_weight": (float(pos_weight.item()) if pos_weight is not None else None),
+            "pos_weight": None,
         }
 
     if memory_usage is not None:
