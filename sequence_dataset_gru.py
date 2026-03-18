@@ -1,25 +1,38 @@
 # sequence_dataset_gru.py
-# Build patient-level sequences from rolling-window features.parquet + samples.csv
+# Build patient-level sequences from rolling-window feature parquet(s) + samples.csv
 # Outputs (X, y, length) per patient for GRU/LSTM models.
 #
-# Uses the 'split' column in samples.csv (train/val/test) to match your ML pipeline.
+# Uses the 'split' column in samples.csv to match your ML pipeline.
 # Enforces patient-level splitting: a patient must not appear in multiple splits.
 #
 # IMPORTANT:
 # - If samples.csv includes 't_event' and 'lead_time_mins', we keep them in df for evaluation,
 #   but we EXCLUDE them from model features so they are not normalized or used as inputs.
 #
+# FEATURE MODE SUPPORT:
+# - config.FEATURE_MODE == "all"
+#     -> load full feature parquet
+# - config.FEATURE_MODE == "vitals"
+#     -> load vitals-only parquet
+# - config.FEATURE_MODE == "vitals+demo"
+#     -> load vitals parquet + full baseline parquet
+#
 # MEMORY FIX:
 # - If top_k is provided, we only load ["patientunitstayid", "t_end"] + top_k ranked feature columns
-#   from features.parquet. This prevents loading a huge wide dataframe into RAM.
+#   from the full features parquet. This prevents loading a huge wide dataframe into RAM.
+# - top_k / rank_path are only valid when FEATURE_MODE == "all"
 #
 # ROBUSTNESS FIX:
 # - If rank CSV contains feature names not present in features.parquet (e.g. *_missing),
 #   we filter them out using the parquet schema (without reading the full dataset).
+#
+# NEW (federation support):
+# - PatientSequenceDataset accepts samples_path override so each node can point to its own samples CSV.
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple, Set
+from pathlib import Path
+from typing import List, Optional, Tuple, Set, Union
 
 import numpy as np
 import pandas as pd
@@ -29,15 +42,14 @@ from torch.utils.data import Dataset
 import config
 
 
-def _read_samples(samples_path: str) -> pd.DataFrame:
-    df = pd.read_csv(samples_path)
+def _read_samples(samples_path: Union[str, Path]) -> pd.DataFrame:
+    df = pd.read_csv(str(samples_path))
 
     need = {"patientunitstayid", "t_end", "label", "split"}
     missing = need - set(df.columns)
     if missing:
         raise ValueError(f"samples.csv missing columns: {sorted(missing)}")
 
-    # Optional columns for true lead-time evaluation
     optional_cols = []
     for c in ["t_event", "lead_time_mins"]:
         if c in df.columns:
@@ -73,7 +85,6 @@ def _read_samples(samples_path: str) -> pd.DataFrame:
 
 
 def _parquet_schema_columns(features_path: str) -> Set[str]:
-    # Read only parquet schema (cheap) to know which columns exist
     try:
         import pyarrow.parquet as pq
     except Exception as e:
@@ -98,7 +109,6 @@ def _load_ranked_features(rank_path: str, top_k: int, features_path: str) -> Lis
     kept = [c for c in want if c in existing]
 
     if len(kept) == 0:
-        # Give a helpful message including an example of the mismatch
         example = want[0] if want else "(none)"
         raise ValueError(
             "None of the requested top_k ranked features were found in features.parquet. "
@@ -108,7 +118,6 @@ def _load_ranked_features(rank_path: str, top_k: int, features_path: str) -> Lis
         )
 
     if len(kept) < len(want):
-        # Non-fatal: just warn via print so the run continues
         skipped = len(want) - len(kept)
         print("#############################")
         print("WARNING: rank_path contains features not present in features.parquet")
@@ -130,9 +139,8 @@ def _read_features(features_path: str, columns: Optional[List[str]] = None) -> p
     need = {"patientunitstayid", "t_end"}
     missing = need - set(df.columns)
     if missing:
-        raise ValueError(f"features.parquet missing columns: {sorted(missing)}")
+        raise ValueError(f"features parquet missing columns: {sorted(missing)}")
 
-    # Avoid df.copy() here (can double memory)
     df = df.replace([np.inf, -np.inf], np.nan)
 
     df["patientunitstayid"] = pd.to_numeric(df["patientunitstayid"], errors="coerce")
@@ -186,7 +194,6 @@ def _restrict_to_topk_features(
     top_k: int,
     rank_path: Optional[str],
 ) -> List[str]:
-    # Safety net only (after merge). Primary filtering is done at parquet read time.
     top_k = int(top_k)
     if top_k <= 0:
         raise ValueError("top_k must be a positive integer")
@@ -220,6 +227,65 @@ def _assert_patient_split_consistent(samples: pd.DataFrame) -> None:
         )
 
 
+def _feature_mode() -> str:
+    mode = str(getattr(config, "FEATURE_MODE", "all")).strip().lower()
+    valid = {"all", "vitals", "vitals+demo"}
+    if mode not in valid:
+        raise ValueError(f"Unsupported config.FEATURE_MODE={mode!r}. Expected one of {sorted(valid)}")
+    return mode
+
+
+def _load_features_for_mode(
+    disease: config.DiseaseSpec,
+    feature_mode: str,
+    top_k: Optional[int],
+    rank_path: Optional[str],
+) -> pd.DataFrame:
+    if feature_mode == "all":
+        features_path = str(config.features_path(disease))
+
+        feat_columns = None
+        if top_k is not None:
+            if rank_path is None:
+                raise ValueError("top_k was set but rank_path is None")
+            ranked = _load_ranked_features(rank_path, top_k=int(top_k), features_path=features_path)
+            feat_columns = ["patientunitstayid", "t_end"] + ranked
+
+        return _read_features(features_path, columns=feat_columns)
+
+    if top_k is not None or rank_path is not None:
+        raise ValueError(
+            f"top_k/rank_path are only supported when FEATURE_MODE == 'all'. "
+            f"Current FEATURE_MODE is {feature_mode!r}."
+        )
+
+    if feature_mode == "vitals":
+        vitals_path = str(config.vitals_features_path(disease))
+        return _read_features(vitals_path)
+
+    if feature_mode == "vitals+demo":
+        vitals_path = str(config.vitals_features_path(disease))
+        baseline_path = str(config.baseline_features_path(disease))
+
+        vitals = _read_features(vitals_path)
+        baseline = _read_features(baseline_path)
+
+        merged = vitals.merge(
+            baseline,
+            on=["patientunitstayid", "t_end"],
+            how="inner",
+            suffixes=("", "__dup"),
+        )
+
+        dup_cols = [c for c in merged.columns if c.endswith("__dup")]
+        if dup_cols:
+            merged = merged.drop(columns=dup_cols)
+
+        return merged
+
+    raise ValueError(f"Unsupported FEATURE_MODE: {feature_mode}")
+
+
 class PatientSequenceDataset(Dataset):
     """
     Returns per-patient sequences:
@@ -238,6 +304,7 @@ class PatientSequenceDataset(Dataset):
         cached_norm_path: Optional[str] = None,
         top_k: Optional[int] = None,
         rank_path: Optional[str] = None,
+        samples_path: Optional[Union[str, Path]] = None,
     ) -> None:
         super().__init__()
         if split not in {"train", "val", "test"}:
@@ -250,46 +317,50 @@ class PatientSequenceDataset(Dataset):
 
         self.split = split
         self.max_len = int(max_len)
+        self.seed = int(seed)
 
-        samples_path = str(config.samples_path(disease))
-        features_path = str(config.features_path(disease))
+        if samples_path is None:
+            samples_path_str = str(config.samples_path(disease))
+        else:
+            samples_path_str = str(Path(samples_path))
 
-        samples = _read_samples(samples_path)
+        feature_mode = _feature_mode()
+        print("#############################")
+        print(f"PatientSequenceDataset split={split}")
+        print(f"FEATURE_MODE={feature_mode}")
+        print("#############################")
 
-        # MEMORY + ROBUSTNESS FIX:
-        feat_columns = None
-        if top_k is not None:
-            if rank_path is None:
-                raise ValueError("top_k was set but rank_path is None")
-
-            ranked = _load_ranked_features(rank_path, top_k=int(top_k), features_path=features_path)
-            feat_columns = ["patientunitstayid", "t_end"] + ranked
-
-        feats = _read_features(features_path, columns=feat_columns)
+        samples = _read_samples(samples_path_str)
+        feats = _load_features_for_mode(
+            disease=disease,
+            feature_mode=feature_mode,
+            top_k=top_k,
+            rank_path=rank_path,
+        )
 
         _assert_patient_split_consistent(samples)
 
         df = samples.merge(feats, on=["patientunitstayid", "t_end"], how="inner")
         if df.empty:
-            raise ValueError("Merged dataset is empty. Check that samples.csv and features.parquet align.")
+            raise ValueError("Merged dataset is empty. Check that samples.csv and feature parquet(s) align.")
 
         df = df.sort_values(["patientunitstayid", "t_end"]).reset_index(drop=True)
 
         feature_cols = _select_feature_columns(df)
 
-        # Filter by split
         df = df[df["split"] == split].copy()
         df = df.sort_values(["patientunitstayid", "t_end"]).reset_index(drop=True)
         if df.empty:
             raise ValueError(f"No rows left after applying split='{split}'. Check samples.csv split column.")
 
-        # Safety net top-k restriction
         if top_k is not None:
+            if feature_mode != "all":
+                raise ValueError("top_k is only valid when FEATURE_MODE == 'all'")
             feature_cols = _restrict_to_topk_features(df, feature_cols, top_k=top_k, rank_path=rank_path)
 
         self.feature_cols = feature_cols
+        self.feature_mode = feature_mode
 
-        # Normalization (train stats only)
         self.mean = None
         self.std = None
         if normalize:
@@ -311,7 +382,6 @@ class PatientSequenceDataset(Dataset):
         self.df = df
         self.pids = df["patientunitstayid"].unique().astype(np.int64)
 
-        # Pre-store group indices
         self._groups: List[np.ndarray] = []
         pid_values = df["patientunitstayid"].to_numpy(dtype=np.int64)
 

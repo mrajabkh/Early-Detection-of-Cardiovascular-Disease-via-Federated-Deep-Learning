@@ -35,22 +35,45 @@ DISEASE = DiseaseSpec(
 
 
 #############################
-# Rolling window settings
+# Temporal labeling + sequence history (GRU setup)
 #############################
-HISTORY_HRS = 12
-HORIZON_HRS = 12
+# Horizon labeling:
+# positive at window end t_end if:
+#   t_end + LEAD_TIME_MINS < onset_time <= t_end + HORIZON_MINS
+LEAD_TIME_MINS = 30
+
+# Prediction cadence
 STRIDE_MINS = 60
 
-HISTORY_MINS = HISTORY_HRS * 60
+# Horizon for the label window (primary = 4h)
+HORIZON_HRS = 4
 HORIZON_MINS = HORIZON_HRS * 60
 
+# Sequence history rules for GRU inputs
+MIN_HISTORY_HRS = 1
+MAX_HISTORY_HRS = 6
+MIN_HISTORY_MINS = MIN_HISTORY_HRS * 60
+MAX_HISTORY_MINS = MAX_HISTORY_HRS * 60
+
+# Pad sequences to this many timesteps (6h max history with 60m stride -> 6 steps)
+# If you ever change STRIDE_MINS, keep this consistent.
+SEQ_MAX_STEPS = MAX_HISTORY_MINS // STRIDE_MINS
+
+
+# Federated node assignment
+# Choose top-K hospitals by number of positive patients as anchors.
+NUM_ANCHOR_HOSPITALS = 5
+NODE_ASSIGNMENT_SEED = 42
+
 
 #############################
-# Windowing strategy (Strategy 1)
+# Feature mode switch (inputs to models)
 #############################
-WINDOWING_STRATEGY = "strategy1"
-NON_EVENT_N_MULT = 2  # N = 2H
-
+# Options:
+#   - "vitals"            -> vitalPeriodic + vitalAperiodic only
+#   - "vitals+demo"       -> vitals + demographics
+#   - "all"               -> whatever your full feature parquet contains
+FEATURE_MODE = "all"
 
 #############################
 # Optional: cap total windows by sampling patients
@@ -68,18 +91,6 @@ SEED = 42
 REQUIRE_FULL_HORIZON = True
 
 
-#############################
-# Optional: balancing (global)
-#############################
-# This controls the 1:1 behavior you observed.
-# If BALANCE_ENABLED is False, prepare_data will NOT downsample negatives to match positives.
-#bad dont use
-BALANCE_ENABLED = False
-
-# Only used if BALANCE_ENABLED is True.
-NEGATIVE_POSITIVE_RATIO = 1.0
-NEGATIVE_WINDOWS_PER_PATIENT_CAP: Optional[int] = None
-
 
 #############################
 # Train/val/test split
@@ -93,7 +104,7 @@ STRATIFY_SPLIT = True
 #############################
 # Test-only monitoring density filter (Option 3)
 #############################
-APPLY_TEST_DENSITY_FILTER = True
+APPLY_TEST_DENSITY_FILTER = False
 TEST_DENSITY_POS_QUANTILE = 0.25
 
 # Vitals definition for density: any presence in these columns counts as monitored
@@ -118,9 +129,9 @@ VA_VITAL_COLS = [
 # Negative limiter (cap Neg:Pos) applied PER SPLIT after split assignment
 #############################
 # NOTE: Name kept for compatibility, but it now applies to train/val/test.
-TEST_NEG_LIMITER_ENABLED = True
-TEST_NEG_POS_MAX_RATIO = 10.0
-TEST_NEG_LIMITER_RANDOM_STATE = 42
+NEG_LIMITER_ENABLED = True
+NEG_POS_MAX_RATIO = 10.0
+NEG_LIMITER_RANDOM_STATE = 42
 
 
 USE_POS_WEIGHT = True
@@ -238,11 +249,16 @@ def disease_tag(disease: DiseaseSpec = DISEASE) -> str:
 
 
 def run_name(disease: DiseaseSpec = DISEASE) -> str:
+    # Include the GRU-relevant knobs so outputs are clearly tied to a setup.
+    # feature_tag = slugify(FEATURE_MODE)
     return (
         f"{disease_tag(disease)}"
-        f"__hist{HISTORY_HRS}h"
         f"__hor{HORIZON_HRS}h"
+        f"__lead{LEAD_TIME_MINS}m"
         f"__stride{STRIDE_MINS}m"
+        f"__minhist{MIN_HISTORY_HRS}h"
+        f"__maxhist{MAX_HISTORY_HRS}h"
+        # f"__feat{feature_tag}"
     )
 
 
@@ -312,3 +328,15 @@ def gru_results_path(disease: DiseaseSpec = DISEASE) -> Path:
 
 def gru_checkpoint_path(disease: DiseaseSpec = DISEASE) -> Path:
     return run_dir(disease) / gru_checkpoint_filename(disease)
+
+def vitals_features_filename(disease: DiseaseSpec = DISEASE) -> str:
+    return f"features_vitals__{disease_tag(disease)}.parquet"
+
+def baseline_features_filename(disease: DiseaseSpec = DISEASE) -> str:
+    return f"features_baseline__{disease_tag(disease)}.parquet"
+
+def vitals_features_path(disease: DiseaseSpec = DISEASE) -> Path:
+    return run_dir(disease) / vitals_features_filename(disease)
+
+def baseline_features_path(disease: DiseaseSpec = DISEASE) -> Path:
+    return run_dir(disease) / baseline_features_filename(disease)

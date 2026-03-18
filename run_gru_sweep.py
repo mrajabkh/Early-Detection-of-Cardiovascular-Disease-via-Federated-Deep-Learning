@@ -1,5 +1,13 @@
 # run_gru_sweep.py
-# Run GRU experiments with top-K feature limits
+# Run GRU experiments with feature-mode aware logic.
+#
+# Behavior:
+# - FEATURE_MODE == "all":
+#     run Top-K sweep using rank_path
+# - FEATURE_MODE == "vitals":
+#     run a single GRU using the full vitals parquet (no feature selection)
+# - FEATURE_MODE == "vitals+demo":
+#     run a single GRU using vitals + baseline parquet (no feature selection)
 #
 # Output CSV columns (as requested):
 # - AUROC/AUPRC only for TRAIN and TEST (no VAL columns)
@@ -23,6 +31,14 @@ def _round_3dp(df: pd.DataFrame) -> pd.DataFrame:
     return df2
 
 
+def _feature_mode() -> str:
+    mode = str(getattr(config, "FEATURE_MODE", "all")).strip().lower()
+    valid = {"all", "vitals", "vitals+demo"}
+    if mode not in valid:
+        raise ValueError(f"Unsupported config.FEATURE_MODE={mode!r}. Expected one of {sorted(valid)}")
+    return mode
+
+
 def run_sweep(
     ks: List[Optional[int]],
     rank_path: Optional[str] = None,
@@ -30,20 +46,42 @@ def run_sweep(
 
     disease = config.DISEASE
     cfg = TrainConfig()
+    feature_mode = _feature_mode()
 
     rows = []
 
-    for k in ks:
-        k_name = "all" if k is None else str(int(k))
+    if feature_mode == "all":
+        run_ks = ks
+        run_rank_path = rank_path
+        if run_rank_path is None:
+            raise ValueError("FEATURE_MODE='all' requires rank_path for Top-K GRU sweep.")
+    else:
+        # No feature selection for vitals or vitals+demo
+        run_ks = [None]
+        run_rank_path = None
 
-        print("#############################")
-        print(f"GRU run | top_k={k_name}")
-        print(f"rank_path={rank_path}")
-        print("#############################")
+    for k in run_ks:
+        if feature_mode == "all":
+            k_name = "all" if k is None else str(int(k))
+            print("#############################")
+            print(f"GRU run | FEATURE_MODE={feature_mode} | top_k={k_name}")
+            print(f"rank_path={run_rank_path}")
+            print("#############################")
+        else:
+            k_name = "none"
+            print("#############################")
+            print(f"GRU run | FEATURE_MODE={feature_mode} | no feature selection")
+            print("#############################")
 
-        out = train_and_eval(disease=disease, cfg=cfg, top_k=k, rank_path=rank_path)
+        out = train_and_eval(
+            disease=disease,
+            cfg=cfg,
+            top_k=k,
+            rank_path=run_rank_path,
+        )
 
         row = {
+            "feature_mode": out["extra"].get("feature_mode", feature_mode),
             "top_k": k_name,
             "n_features": out["extra"]["n_features"],
 
@@ -78,6 +116,7 @@ def run_sweep(
     df = pd.DataFrame(rows)
 
     col_order = [
+        "feature_mode",
         "top_k",
         "n_features",
         "train_auroc",
@@ -117,6 +156,13 @@ def run_sweep(
 
 
 if __name__ == "__main__":
-    ks = [20, 40, 60, 80, 100, 120]
-    rank_path = str(config.stability_combined_path(config.DISEASE))
+    feature_mode = _feature_mode()
+
+    if feature_mode == "all":
+        ks = [60]
+        rank_path = str(config.stability_combined_path(config.DISEASE))
+    else:
+        ks = [None]
+        rank_path = None
+
     run_sweep(ks=ks, rank_path=rank_path)
