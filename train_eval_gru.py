@@ -53,6 +53,17 @@ ATTN_AUX_WEIGHT = 0.1
 
 
 #############################
+# Feature mode helpers
+#############################
+def _feature_mode() -> str:
+    return str(getattr(config, "FEATURE_MODE", "all")).strip().lower()
+
+
+def _feature_mode_tag() -> str:
+    return _feature_mode().replace("+", "_")
+
+
+#############################
 # Metrics
 #############################
 def roc_auc_score_manual(y_true: np.ndarray, y_score: np.ndarray) -> float:
@@ -439,21 +450,25 @@ def _save_test_curves(
     curves_dir = out_dir / "Curves"
     curves_dir.mkdir(parents=True, exist_ok=True)
 
-    topk_tag = "all" if top_k is None else str(int(top_k))
+    feature_mode = _feature_mode()
+    if feature_mode == "all":
+        run_tag = "all" if top_k is None else f"topk{int(top_k)}"
+    else:
+        run_tag = f"feat{_feature_mode_tag()}"
 
     y_true, y_prob = _flatten_loader_probs(model, test_loader, device=device)
     if y_true.size == 0:
         return {"roc_path": None, "pr_path": None}
 
-    roc_path = str(curves_dir / f"roc_test__topk{topk_tag}.png")
-    pr_path = str(curves_dir / f"pr_test__topk{topk_tag}.png")
+    roc_path = str(curves_dir / f"roc_test__{run_tag}.png")
+    pr_path = str(curves_dir / f"pr_test__{run_tag}.png")
 
     fpr, tpr = _roc_curve_manual(y_true, y_prob)
     plt.figure()
     plt.plot(fpr, tpr)
     plt.xlabel("False Positive Rate")
     plt.ylabel("True Positive Rate")
-    plt.title(f"ROC curve (TEST, top_k={topk_tag})")
+    plt.title(f"ROC curve (TEST, {run_tag})")
     plt.tight_layout()
     plt.savefig(roc_path, dpi=200)
     plt.close()
@@ -463,7 +478,7 @@ def _save_test_curves(
     plt.plot(recall, precision)
     plt.xlabel("Recall")
     plt.ylabel("Precision")
-    plt.title(f"PR curve (TEST, top_k={topk_tag})")
+    plt.title(f"PR curve (TEST, {run_tag})")
     plt.tight_layout()
     plt.savefig(pr_path, dpi=200)
     plt.close()
@@ -624,6 +639,7 @@ def train_and_eval(
             "test": test_metrics,
             "threshold": float(chosen_threshold),
             "n_features": len(train_ds.feature_cols),
+            "feature_mode": _feature_mode(),
             "curve_paths": curve_paths,
             "pos_weight": None,
         }
@@ -641,6 +657,7 @@ def train_and_eval(
         "runtime_sec": runtime,
         "cpu_peak_mib": cpu_peak,
         "n_features": out["n_features"],
+        "feature_mode": out.get("feature_mode", None),
         "roc_path": out.get("curve_paths", {}).get("roc_path", None),
         "pr_path": out.get("curve_paths", {}).get("pr_path", None),
         "pos_weight": out.get("pos_weight", None),
