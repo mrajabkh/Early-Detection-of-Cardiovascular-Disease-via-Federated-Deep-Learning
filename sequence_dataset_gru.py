@@ -28,6 +28,10 @@
 #
 # NEW (federation support):
 # - PatientSequenceDataset accepts samples_path override so each node can point to its own samples CSV.
+#
+# NEW (XAI support):
+# - Each dataset item now also returns patientunitstayid so downstream code can save
+#   patient-level predictions for explainability.
 
 from __future__ import annotations
 
@@ -292,6 +296,7 @@ class PatientSequenceDataset(Dataset):
       X: (T, D) float32
       y: (T,) int64
       length: int64 (<= max_len)
+      pid: int64
     """
 
     def __init__(
@@ -399,12 +404,13 @@ class PatientSequenceDataset(Dataset):
     def __len__(self) -> int:
         return len(self.pids)
 
-    def __getitem__(self, i: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, i: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         idx = self._groups[i]
         sub = self.df.iloc[idx]
 
         x = sub[self.feature_cols].to_numpy(dtype=np.float32)
         y = sub["label"].to_numpy(dtype=np.int64)
+        pid = np.int64(self.pids[i])
 
         if len(y) > self.max_len:
             x = x[-self.max_len :]
@@ -416,12 +422,14 @@ class PatientSequenceDataset(Dataset):
             torch.from_numpy(x),
             torch.from_numpy(y),
             torch.tensor(length, dtype=torch.long),
+            torch.tensor(pid, dtype=torch.long),
         )
 
 
 def pad_collate(batch):
-    xs, ys, lens = zip(*batch)
+    xs, ys, lens, pids = zip(*batch)
     lengths = torch.stack(lens, dim=0)
+    pids = torch.stack(pids, dim=0)
 
     bsz = len(xs)
     d = xs[0].shape[1]
@@ -437,4 +445,4 @@ def pad_collate(batch):
         y_pad[i, :t] = ys[i]
         mask[i, :t] = 1.0
 
-    return x_pad, y_pad, mask, lengths
+    return x_pad, y_pad, mask, lengths, pids

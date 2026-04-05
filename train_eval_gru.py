@@ -20,14 +20,22 @@
 # - Model may return dict containing logits_ts and optional logit_seq.
 # - If logit_seq exists, we can add an auxiliary sequence-level loss.
 #   This gives you attention weights for XAI later without changing evaluation.
+#
+# NEW (XAI prep):
+# - Saves trained model checkpoint to the normal output folder from config.
+# - Saves metadata.json with feature names and model config.
+# - Saves test_predictions.csv with one row per patient so explainability can
+#   sample TP / TN / FP / FN cases later.
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
+import json
 import time
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -61,6 +69,13 @@ def _feature_mode() -> str:
 
 def _feature_mode_tag() -> str:
     return _feature_mode().replace("+", "_")
+
+
+def _run_tag(top_k: int | None) -> str:
+    feature_mode = _feature_mode()
+    if feature_mode == "all":
+        return "all" if top_k is None else f"topk{int(top_k)}"
+    return f"feat{_feature_mode_tag()}"
 
 
 #############################
@@ -172,7 +187,6 @@ def _roc_curve_manual(y_true: np.ndarray, y_score: np.ndarray) -> Tuple[np.ndarr
 
 
 def _model_forward_logits_ts(model_out) -> torch.Tensor:
-    # Support dict output
     if isinstance(model_out, dict):
         return model_out["logits_ts"]
     return model_out
@@ -190,7 +204,7 @@ def _flatten_loader_probs(model, loader, device) -> Tuple[np.ndarray, np.ndarray
     all_p: List[np.ndarray] = []
 
     with torch.no_grad():
-        for x, y, mask, lengths in loader:
+        for x, y, mask, lengths, pids in loader:
             x = x.to(device)
             y = y.to(device)
             mask = mask.to(device)
@@ -327,12 +341,6 @@ def masked_focal_loss(
 
 
 def _compute_seq_targets(y: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """
-    Create a sequence-level label per patient: 1 if ANY valid timestep is positive else 0.
-    y: (B, T) int/long
-    mask: (B, T) float
-    returns y_seq: (B,) float
-    """
     valid = mask > 0.5
     y_pos = (y > 0.5) & valid
     y_seq = y_pos.any(dim=1).float()
@@ -343,7 +351,7 @@ def _compute_pos_weight_from_loader(train_loader: DataLoader, device: str) -> to
     n_pos = 0
     n_neg = 0
 
-    for x, y, mask, lengths in train_loader:
+    for x, y, mask, lengths, pids in train_loader:
         y_np = y.detach().cpu().numpy().astype(np.int64)
         m_np = mask.detach().cpu().numpy().astype(np.float32)
 
@@ -394,7 +402,7 @@ def evaluate(model, loader, device):
     all_y, all_s = [], []
     total_loss = 0.0
 
-    for x, y, mask, lengths in loader:
+    for x, y, mask, lengths, pids in loader:
         x = x.to(device)
         y = y.to(device)
         mask = mask.to(device)
@@ -450,11 +458,7 @@ def _save_test_curves(
     curves_dir = out_dir / "Curves"
     curves_dir.mkdir(parents=True, exist_ok=True)
 
-    feature_mode = _feature_mode()
-    if feature_mode == "all":
-        run_tag = "all" if top_k is None else f"topk{int(top_k)}"
-    else:
-        run_tag = f"feat{_feature_mode_tag()}"
+    run_tag = _run_tag(top_k)
 
     y_true, y_prob = _flatten_loader_probs(model, test_loader, device=device)
     if y_true.size == 0:
@@ -484,6 +488,136 @@ def _save_test_curves(
     plt.close()
 
     return {"roc_path": roc_path, "pr_path": pr_path}
+
+
+#############################
+# XAI artifact helpers
+#############################
+def _collect_patient_level_predictions(model, loader, device, threshold: float) -> pd.DataFrame:
+    model.eval()
+    rows: List[Dict[str, float | int | str]] = []
+
+    with torch.no_grad():
+        for x, y, mask, lengths, pids in loader:
+            x = x.to(device)
+            y = y.to(device)
+            mask = mask.to(device)
+
+            out = model(x, lengths)
+            logits = _model_forward_logits_ts(out)
+            probs = torch.sigmoid(logits)
+
+            probs_np = probs.detach().cpu().numpy().astype(np.float64)
+            y_np = y.detach().cpu().numpy().astype(np.int64)
+            mask_np = mask.detach().cpu().numpy().astype(np.float32)
+            pids_np = pids.detach().cpu().numpy().astype(np.int64)
+
+            for i in range(len(pids_np)):
+                valid = mask_np[i] > 0.5
+                if not np.any(valid):
+                    continue
+
+                seq_probs = probs_np[i, valid]
+                seq_y = y_np[i, valid]
+
+                pred_prob = float(seq_probs.max())
+                true_label = int((seq_y == 1).any())
+                pred_label = int(pred_prob >= float(threshold))
+
+                if true_label == 1 and pred_label == 1:
+                    outcome_type = "TP"
+                elif true_label == 0 and pred_label == 0:
+                    outcome_type = "TN"
+                elif true_label == 0 and pred_label == 1:
+                    outcome_type = "FP"
+                else:
+                    outcome_type = "FN"
+
+                rows.append(
+                    {
+                        "patient_id": int(pids_np[i]),
+                        "true_label": int(true_label),
+                        "pred_prob": float(pred_prob),
+                        "pred_label": int(pred_label),
+                        "outcome_type": outcome_type,
+                        "threshold": float(threshold),
+                    }
+                )
+
+    if not rows:
+        return pd.DataFrame(
+            columns=["patient_id", "true_label", "pred_prob", "pred_label", "outcome_type", "threshold"]
+        )
+
+    return pd.DataFrame(rows)
+
+
+def _save_xai_artifacts(
+    model,
+    disease: config.DiseaseSpec,
+    cfg: TrainConfig,
+    top_k: int | None,
+    threshold: float,
+    feature_names: List[str],
+    test_pred_df: pd.DataFrame,
+) -> Dict[str, str]:
+    out_dir = config.run_dir(disease)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    run_tag = _run_tag(top_k)
+
+    model_path = str(out_dir / f"model__{run_tag}.pt")
+    metadata_path = str(out_dir / f"metadata__{run_tag}.json")
+    predictions_path = str(out_dir / f"test_predictions__{run_tag}.csv")
+
+    checkpoint = {
+        "model_state_dict": model.state_dict(),
+        "input_dim": int(len(feature_names)),
+        "hidden_dim": int(cfg.hidden_dim),
+        "num_layers": int(cfg.num_layers),
+        "dropout": float(cfg.dropout),
+        "max_len": int(cfg.max_len),
+        "feature_names": list(feature_names),
+        "threshold": float(threshold),
+        "feature_mode": _feature_mode(),
+        "top_k": None if top_k is None else int(top_k),
+        "use_layernorm": True,
+        "use_attention_pooling": True,
+    }
+    torch.save(checkpoint, model_path)
+
+    metadata = {
+        "input_dim": int(len(feature_names)),
+        "hidden_dim": int(cfg.hidden_dim),
+        "num_layers": int(cfg.num_layers),
+        "dropout": float(cfg.dropout),
+        "max_len": int(cfg.max_len),
+        "batch_size": int(cfg.batch_size),
+        "lr": float(cfg.lr),
+        "weight_decay": float(cfg.weight_decay),
+        "epochs": int(cfg.epochs),
+        "patience": int(cfg.patience),
+        "seed": int(cfg.seed),
+        "device": str(cfg.device),
+        "threshold": float(threshold),
+        "feature_mode": _feature_mode(),
+        "top_k": None if top_k is None else int(top_k),
+        "feature_names": list(feature_names),
+        "use_layernorm": True,
+        "use_attention_pooling": True,
+        "attn_aux_enabled": bool(ATTN_AUX_ENABLED),
+        "attn_aux_weight": float(ATTN_AUX_WEIGHT),
+    }
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+
+    test_pred_df.to_csv(predictions_path, index=False)
+
+    return {
+        "model_path": model_path,
+        "metadata_path": metadata_path,
+        "predictions_path": predictions_path,
+    }
 
 
 #############################
@@ -548,7 +682,7 @@ def train_and_eval(
 
         for epoch in range(cfg.epochs):
             model.train()
-            for x, y, mask, lengths in train_loader:
+            for x, y, mask, lengths, pids in train_loader:
                 x = x.to(cfg.device)
                 y = y.to(cfg.device)
                 mask = mask.to(cfg.device)
@@ -558,7 +692,6 @@ def train_and_eval(
                 out = model(x, lengths)
                 logits_ts = _model_forward_logits_ts(out)
 
-                # Main per-timestep focal loss
                 loss_ts = masked_focal_loss(
                     logits_ts,
                     y,
@@ -570,12 +703,10 @@ def train_and_eval(
 
                 loss = loss_ts
 
-                # Optional aux sequence loss (attention pooling head)
                 if ATTN_AUX_ENABLED:
                     logit_seq = _model_forward_logit_seq(out)
                     if logit_seq is not None:
-                        y_seq = _compute_seq_targets(y, mask)  # (B,)
-                        # Use BCE for sequence aux head (simple + stable)
+                        y_seq = _compute_seq_targets(y, mask)
                         loss_seq = nn.functional.binary_cross_entropy_with_logits(
                             logit_seq,
                             y_seq,
@@ -589,7 +720,7 @@ def train_and_eval(
             val = evaluate(model, val_loader, cfg.device)
             if val["auroc"] > best_val:
                 best_val = val["auroc"]
-                best_state = model.state_dict()
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
                 bad_epochs = 0
             else:
                 bad_epochs += 1
@@ -633,6 +764,23 @@ def train_and_eval(
             device=cfg.device,
         )
 
+        test_pred_df = _collect_patient_level_predictions(
+            model=model,
+            loader=test_loader,
+            device=cfg.device,
+            threshold=float(chosen_threshold),
+        )
+
+        artifact_paths = _save_xai_artifacts(
+            model=model,
+            disease=disease,
+            cfg=cfg,
+            top_k=top_k,
+            threshold=float(chosen_threshold),
+            feature_names=list(train_ds.feature_cols),
+            test_pred_df=test_pred_df,
+        )
+
         return {
             "train": train_metrics,
             "val": val_metrics,
@@ -641,6 +789,7 @@ def train_and_eval(
             "n_features": len(train_ds.feature_cols),
             "feature_mode": _feature_mode(),
             "curve_paths": curve_paths,
+            "artifact_paths": artifact_paths,
             "pos_weight": None,
         }
 
@@ -660,6 +809,9 @@ def train_and_eval(
         "feature_mode": out.get("feature_mode", None),
         "roc_path": out.get("curve_paths", {}).get("roc_path", None),
         "pr_path": out.get("curve_paths", {}).get("pr_path", None),
+        "model_path": out.get("artifact_paths", {}).get("model_path", None),
+        "metadata_path": out.get("artifact_paths", {}).get("metadata_path", None),
+        "predictions_path": out.get("artifact_paths", {}).get("predictions_path", None),
         "pos_weight": out.get("pos_weight", None),
         "threshold": out.get("threshold", None),
     }
