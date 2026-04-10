@@ -2,7 +2,7 @@
 # Simulated Federated Learning (FedAvg) for your GRU early detection model.
 #
 # Requirements in your run folder (config.run_dir(disease)):
-# - samples_with_node.csv  (must include columns: patientunitstayid, t_end, label, split, node_id)
+# - samples.csv with node_id (must include columns: patientunitstayid, t_end, label, split, node_id)
 # - features.parquet       (as usual)
 #
 # This script:
@@ -17,9 +17,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple, Any
 
+import json
 import time
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as nn
@@ -38,12 +40,20 @@ from train_eval_gru import (
     _model_forward_logit_seq,
     _compute_seq_targets,
     _flatten_loader_probs,
+    _collect_patient_level_predictions,
     _pick_threshold_max_f1,
+    _run_tag,
+    _feature_mode,
     _threshold_metrics,
     _save_test_curves,
     ATTN_AUX_ENABLED,
     ATTN_AUX_WEIGHT,
 )
+
+# Centralized benchmark metrics for comparison in federated plots.
+# Update these values with your centralized model results.
+CENTRALIZED_AUROC: float | None = 0.887
+CENTRALIZED_AUPRC: float | None = 0.645
 
 
 @dataclass
@@ -135,6 +145,56 @@ def _write_node_samples_csvs(
     return node_ids, node_csv_paths, node_train_sizes
 
 
+def _save_fed_history_plot(
+    history_rows: List[Dict[str, float]],
+    out_dir: Path,
+    centralized_auroc: float | None = None,
+    centralized_auprc: float | None = None,
+) -> Path:
+    if not history_rows:
+        raise ValueError("Federated history is empty.")
+
+    df = pd.DataFrame(history_rows)
+    rounds = df["round"].tolist()
+    auroc = df["val_auroc"].tolist()
+    auprc = df["val_auprc"].tolist()
+
+    save_path = out_dir / "fedavg_validation_history.png"
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(rounds, auroc, marker="o", linewidth=2, label="Federated AUROC")
+    plt.plot(rounds, auprc, marker="s", linewidth=2, label="Federated AUPRC")
+
+    if centralized_auroc is not None:
+        plt.axhline(
+            centralized_auroc,
+            color="gray",
+            linestyle="--",
+            linewidth=1.5,
+            label=f"Centralized AUROC = {centralized_auroc:.3f}",
+        )
+
+    if centralized_auprc is not None:
+        plt.axhline(
+            centralized_auprc,
+            color="tab:orange",
+            linestyle="--",
+            linewidth=1.5,
+            label=f"Centralized AUPRC = {centralized_auprc:.3f}",
+        )
+
+    plt.xlabel("Federated round")
+    plt.ylabel("Metric")
+    plt.title("Federated validation performance vs centralized benchmark")
+    plt.grid(alpha=0.3)
+    plt.legend(loc="best")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200)
+    plt.close()
+
+    return save_path
+
+
 def _local_train_one_client(
     model: nn.Module,
     train_loader: DataLoader,
@@ -145,7 +205,7 @@ def _local_train_one_client(
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
     for _ in range(int(local_epochs)):
-        for x, y, mask, lengths in train_loader:
+        for x, y, mask, lengths, _ in train_loader:
             x = x.to(cfg.device)
             y = y.to(cfg.device)
             mask = mask.to(cfg.device)
@@ -191,18 +251,18 @@ def train_and_eval_fedavg(
     rng = np.random.default_rng(int(fed.seed))
 
     run_dir = config.run_dir(disease)
-    samples_with_node_csv = run_dir / "samples_with_node.csv"
-    if not samples_with_node_csv.exists():
+    samples_csv = config.samples_path(disease)
+    if not samples_csv.exists():
         raise FileNotFoundError(
-            f"Missing {samples_with_node_csv}.\n"
-            "Generate it first (samples_with_node.csv + hospital_to_node.json)."
+            f"Missing {samples_csv}.\n"
+            "This file must include node_id for federated training (columns: patientunitstayid, t_end, label, split, node_id)."
         )
 
     cache_dir = run_dir / "Federated"
-    node_ids, node_csv_paths, node_train_sizes = _write_node_samples_csvs(samples_with_node_csv, cache_dir)
+    node_ids, node_csv_paths, node_train_sizes = _write_node_samples_csvs(samples_csv, cache_dir)
 
     # GLOBAL val/test (Option A)
-    # Important: we pass samples_path=samples_with_node_csv so it uses the same file layout.
+    # Important: we pass samples_path=samples_csv so it uses the same file layout.
     val_ds = PatientSequenceDataset(
         split="val",
         disease=disease,
@@ -211,7 +271,7 @@ def train_and_eval_fedavg(
         normalize=True,
         top_k=top_k,
         rank_path=rank_path,
-        samples_path=samples_with_node_csv,
+        samples_path=samples_csv,
     )
     test_ds = PatientSequenceDataset(
         split="test",
@@ -221,7 +281,7 @@ def train_and_eval_fedavg(
         normalize=True,
         top_k=top_k,
         rank_path=rank_path,
-        samples_path=samples_with_node_csv,
+        samples_path=samples_csv,
     )
 
     val_loader = DataLoader(val_ds, cfg.batch_size, False, collate_fn=pad_collate)
@@ -337,6 +397,30 @@ def train_and_eval_fedavg(
         device=cfg.device,
     )
 
+    test_pred_df = _collect_patient_level_predictions(
+        model=model_global,
+        loader=test_loader,
+        device=cfg.device,
+        threshold=float(chosen_threshold),
+    )
+
+    artifact_paths = _save_fed_xai_artifacts(
+        model=model_global,
+        disease=disease,
+        cfg=cfg,
+        top_k=top_k,
+        threshold=float(chosen_threshold),
+        feature_names=list(val_ds.feature_cols),
+        test_pred_df=test_pred_df,
+    )
+
+    history_plot_path = _save_fed_history_plot(
+        history_rows=history_rows,
+        out_dir=cache_dir,
+        centralized_auroc=CENTRALIZED_AUROC,
+        centralized_auprc=CENTRALIZED_AUPRC,
+    )
+
     runtime = float(time.perf_counter() - t0)
 
     return {
@@ -354,6 +438,8 @@ def train_and_eval_fedavg(
         "test": test_metrics,
         "threshold": float(chosen_threshold),
         "curve_paths": curve_paths,
+        "artifact_paths": artifact_paths,
+        "history_plot_path": str(history_plot_path),
         "history": history_rows,
         "n_features": int(len(val_ds.feature_cols)),
     }
@@ -418,6 +504,77 @@ def _save_fed_results_csv(
     return csv_path
 
 
+def _save_fed_xai_artifacts(
+    model: nn.Module,
+    disease: config.DiseaseSpec,
+    cfg: TrainConfig,
+    top_k: int | None,
+    threshold: float,
+    feature_names: List[str],
+    test_pred_df: pd.DataFrame,
+) -> Dict[str, str]:
+    out_dir = config.run_dir(disease) / "Federated"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    run_tag = _run_tag(top_k)
+    model_tag = f"fedavg__{run_tag}"
+
+    model_path = out_dir / f"model__{model_tag}.pt"
+    metadata_path = out_dir / f"metadata__{model_tag}.json"
+    predictions_path = out_dir / f"test_predictions__{model_tag}.csv"
+
+    checkpoint = {
+        "model_state_dict": model.state_dict(),
+        "input_dim": int(len(feature_names)),
+        "hidden_dim": int(cfg.hidden_dim),
+        "num_layers": int(cfg.num_layers),
+        "dropout": float(cfg.dropout),
+        "max_len": int(cfg.max_len),
+        "feature_names": list(feature_names),
+        "threshold": float(threshold),
+        "feature_mode": _feature_mode(),
+        "top_k": None if top_k is None else int(top_k),
+        "use_layernorm": True,
+        "use_attention_pooling": True,
+        "model_type": "fedavg",
+    }
+    torch.save(checkpoint, model_path)
+
+    metadata = {
+        "input_dim": int(len(feature_names)),
+        "hidden_dim": int(cfg.hidden_dim),
+        "num_layers": int(cfg.num_layers),
+        "dropout": float(cfg.dropout),
+        "max_len": int(cfg.max_len),
+        "batch_size": int(cfg.batch_size),
+        "lr": float(cfg.lr),
+        "weight_decay": float(cfg.weight_decay),
+        "epochs": int(cfg.epochs),
+        "patience": int(cfg.patience),
+        "seed": int(cfg.seed),
+        "device": str(cfg.device),
+        "threshold": float(threshold),
+        "feature_mode": _feature_mode(),
+        "top_k": None if top_k is None else int(top_k),
+        "feature_names": list(feature_names),
+        "use_layernorm": True,
+        "use_attention_pooling": True,
+        "attn_aux_enabled": bool(ATTN_AUX_ENABLED),
+        "attn_aux_weight": float(ATTN_AUX_WEIGHT),
+        "model_type": "fedavg",
+    }
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+
+    test_pred_df.to_csv(predictions_path, index=False)
+
+    return {
+        "model_path": str(model_path),
+        "metadata_path": str(metadata_path),
+        "predictions_path": str(predictions_path),
+    }
+
+
 def _pick_disease_from_config() -> config.DiseaseSpec:
     d = getattr(config, "DISEASE", None)
     if d is not None:
@@ -444,7 +601,7 @@ if __name__ == "__main__":
         hidden_dim=128,
         num_layers=1,
         dropout=0.2,
-        lr=5e-4,          # slightly lower than 1e-3 for stability under non-IID
+        lr=2e-4,          # tuned lower for non-IID federated stability
         weight_decay=1e-5,
         epochs=1,         # not used in FL loop (local_epochs controls)
         patience=3,       # not used in FL loop

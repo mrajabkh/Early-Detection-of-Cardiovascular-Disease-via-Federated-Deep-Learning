@@ -10,6 +10,12 @@
 # - saves:
 #     1) temporal SHAP line plot
 #     2) timestamp occlusion line plot
+#     3) global top-15 SHAP beeswarm plot
+#     4) global top-15 SHAP bar plot
+#     5) grouped SHAP bar plot
+#     6) full feature ranking CSV
+#     7) variable ranking CSV
+#     8) grouped ranking CSV
 #
 # Notes:
 # - SHAP explains a patient-level max-risk score:
@@ -17,23 +23,25 @@
 # - patient-level prediction summary still uses max valid timestep probability
 # - padded rows are assumed to be all zeros after normalization
 # - for SHAP wrapper length inference, valid timesteps are inferred from non-zero rows
+# - global beeswarm uses signed SHAP values and aggregated feature values
+# - global feature ranking uses mean absolute SHAP
 
 from __future__ import annotations
 
 import json
 import random
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import matplotlib.pyplot as plt
 
 import config
-from sequence_dataset_gru import PatientSequenceDataset
 from gru_risk import GRURisk
+from sequence_dataset_gru import PatientSequenceDataset
 
 try:
     import shap
@@ -42,6 +50,159 @@ except Exception as e:
     _shap_import_error = e
 else:
     _shap_import_error = None
+
+
+#############################
+# Display names and grouping
+#############################
+FEATURE_DISPLAY_NAMES = {
+    "rch_fio2_max": "FiO2 (max)",
+    "rch_fio2_mean": "FiO2 (mean)",
+    "rch_fio2_min": "FiO2 (min)",
+    "rch_fio2_last": "FiO2 (last)",
+    "pt_admissionweight": "Admission weight",
+    "pt_age": "Age",
+    "pt_admissionheight": "Admission height",
+    "lab_labresult_last": "Lab result (last)",
+    "lab_labresult_max": "Lab result (max)",
+    "lab_labresult_mean": "Lab result (mean)",
+    "lab_labresult_min": "Lab result (min)",
+    "apv_bedcount": "Bed count",
+    "vp_temperature_last": "Temperature (last)",
+    "vp_temperature_mean": "Temperature (mean)",
+    "vp_temperature_max": "Temperature (max)",
+    "vp_temperature_min": "Temperature (min)",
+    "nch_temperature_last": "Temperature nurse-charted (last)",
+    "nch_temperature_mean": "Temperature nurse-charted (mean)",
+    "nch_temperature_min": "Temperature nurse-charted (min)",
+    "nch_temperature_max": "Temperature nurse-charted (max)",
+    "vp_sao2_min": "SpO2 (min)",
+    "vp_sao2_mean": "SpO2 (mean)",
+    "vp_sao2_last": "SpO2 (last)",
+    "vp_sao2_max": "SpO2 (max)",
+    "va_noninvasivesystolic_mean": "SBP (mean)",
+    "va_noninvasivesystolic_max": "SBP (max)",
+    "va_noninvasivesystolic_min": "SBP (min)",
+    "va_noninvasivesystolic_last": "SBP (last)",
+    "nch_non_invasive_bp_last": "SBP nurse-charted (last)",
+    "va_noninvasivemean_last": "MAP (last)",
+    "io_nettotal_last": "Net fluid balance (last)",
+    "io_nettotal_min": "Net fluid balance (min)",
+    "io_nettotal_max": "Net fluid balance (max)",
+    "io_nettotal_mean": "Net fluid balance (mean)",
+    "nch_o2_l_max": "O2 flow (max)",
+    "nch_o2_l_mean": "O2 flow (mean)",
+    "nch_o2_l_min": "O2 flow (min)",
+    "io_outputtotal_max": "Output total (max)",
+    "io_outputtotal_last": "Output total (last)",
+    "io_outputtotal_mean": "Output total (mean)",
+    "vp_heartrate_last": "Heart rate (last)",
+    "vp_heartrate_mean": "Heart rate (mean)",
+    "vp_heartrate_min": "Heart rate (min)",
+    "vp_heartrate_max": "Heart rate (max)",
+    "nch_heart_rate_last": "Heart rate nurse-charted (last)",
+    "nch_heart_rate_mean": "Heart rate nurse-charted (mean)",
+    "nch_heart_rate_min": "Heart rate nurse-charted (min)",
+    "nch_heart_rate_max": "Heart rate nurse-charted (max)",
+    "pt_unitvisitnumber": "Unit visit number",
+    "nch_glasgow_coma_score_last": "GCS (last)",
+    "rch_peep_count": "PEEP count",
+    "vp_respiration_min": "Respiratory rate (min)",
+    "vp_respiration_last": "Respiratory rate (last)",
+    "vp_respiration_mean": "Respiratory rate (mean)",
+    "vp_respiration_max": "Respiratory rate (max)",
+    "io_cellvaluenumeric_last": "Cell value numeric (last)",
+    "nch_pain_score_goal_count": "Pain score goal count",
+    "drug_vasopressor_any": "Vasopressor used",
+    "med_count_in_window": "Medication count",
+    "treatment_count_in_window": "Treatment count",
+}
+
+FEATURE_TO_VARIABLE = {
+    "rch_fio2_max": "FiO2",
+    "rch_fio2_mean": "FiO2",
+    "rch_fio2_min": "FiO2",
+    "rch_fio2_last": "FiO2",
+    "pt_admissionweight": "Admission weight",
+    "pt_age": "Age",
+    "pt_admissionheight": "Admission height",
+    "pt_unitvisitnumber": "Unit visit number",
+    "apv_bedcount": "Bed count",
+    "lab_labresult_last": "Lab result",
+    "lab_labresult_max": "Lab result",
+    "lab_labresult_mean": "Lab result",
+    "lab_labresult_min": "Lab result",
+    "io_cellvaluenumeric_last": "Cell value numeric",
+    "vp_temperature_last": "Temperature",
+    "vp_temperature_mean": "Temperature",
+    "vp_temperature_max": "Temperature",
+    "vp_temperature_min": "Temperature",
+    "nch_temperature_last": "Temperature",
+    "nch_temperature_mean": "Temperature",
+    "nch_temperature_min": "Temperature",
+    "nch_temperature_max": "Temperature",
+    "vp_sao2_min": "SpO2",
+    "vp_sao2_mean": "SpO2",
+    "vp_sao2_last": "SpO2",
+    "vp_sao2_max": "SpO2",
+    "va_noninvasivesystolic_mean": "Systolic blood pressure",
+    "va_noninvasivesystolic_max": "Systolic blood pressure",
+    "va_noninvasivesystolic_min": "Systolic blood pressure",
+    "va_noninvasivesystolic_last": "Systolic blood pressure",
+    "nch_non_invasive_bp_last": "Systolic blood pressure",
+    "va_noninvasivemean_last": "Mean arterial pressure",
+    "io_nettotal_last": "Net fluid balance",
+    "io_nettotal_min": "Net fluid balance",
+    "io_nettotal_max": "Net fluid balance",
+    "io_nettotal_mean": "Net fluid balance",
+    "io_outputtotal_last": "Output total",
+    "io_outputtotal_max": "Output total",
+    "io_outputtotal_mean": "Output total",
+    "nch_o2_l_max": "O2 flow",
+    "nch_o2_l_mean": "O2 flow",
+    "nch_o2_l_min": "O2 flow",
+    "vp_heartrate_last": "Heart rate",
+    "vp_heartrate_mean": "Heart rate",
+    "vp_heartrate_min": "Heart rate",
+    "vp_heartrate_max": "Heart rate",
+    "nch_heart_rate_last": "Heart rate",
+    "nch_heart_rate_mean": "Heart rate",
+    "nch_heart_rate_min": "Heart rate",
+    "nch_heart_rate_max": "Heart rate",
+    "nch_glasgow_coma_score_last": "Glasgow Coma Scale",
+    "nch_pain_score_goal_count": "Pain score goal",
+    "rch_peep_count": "PEEP",
+    "vp_respiration_min": "Respiratory rate",
+    "vp_respiration_last": "Respiratory rate",
+    "vp_respiration_mean": "Respiratory rate",
+    "vp_respiration_max": "Respiratory rate",
+    "drug_vasopressor_any": "EXCLUDE",
+    "med_count_in_window": "EXCLUDE",
+    "treatment_count_in_window": "EXCLUDE",
+}
+
+VARIABLE_TO_GROUP = {
+    "Age": "Baseline and admission",
+    "Admission weight": "Baseline and admission",
+    "Admission height": "Baseline and admission",
+    "Unit visit number": "Baseline and admission",
+    "Bed count": "Baseline and admission",
+    "Heart rate": "Cardiovascular",
+    "Systolic blood pressure": "Cardiovascular",
+    "Mean arterial pressure": "Cardiovascular",
+    "FiO2": "Respiratory and oxygenation",
+    "SpO2": "Respiratory and oxygenation",
+    "O2 flow": "Respiratory and oxygenation",
+    "PEEP": "Respiratory and oxygenation",
+    "Respiratory rate": "Respiratory and oxygenation",
+    "Temperature": "Temperature",
+    "Glasgow Coma Scale": "Neurological",
+    "Pain score goal": "Neurological",
+    "Lab result": "Labs",
+    "Cell value numeric": "Labs",
+    "Net fluid balance": "Fluids and output",
+    "Output total": "Fluids and output",
+}
 
 
 #############################
@@ -63,30 +224,56 @@ def _run_tag_from_metadata(meta: Dict) -> str:
     return f"feat{feature_mode.replace('+', '_')}"
 
 
-def _infer_artifact_paths(disease: config.DiseaseSpec) -> Tuple[Path, Path, Path, Path]:
-    out_dir = config.run_dir(disease)
-    if not out_dir.exists():
-        raise FileNotFoundError(f"Run directory does not exist: {out_dir}")
+def _choose_model_type() -> Optional[str]:
+    print()
+    print("Choose explainability model type:")
+    print("1) Centralized")
+    print("2) Federated")
+    print("3) Quit")
 
-    metadata_files = sorted(out_dir.glob("metadata__*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    choice = input("Selection: ").strip()
+    if choice == "1":
+        return "centralized"
+    if choice == "2":
+        return "federated"
+    if choice == "3":
+        return None
+
+    print("Invalid selection.")
+    return None
+
+
+def _infer_artifact_paths(disease: config.DiseaseSpec, model_type: str = "centralized") -> Tuple[Path, Path, Path, Path]:
+    out_dir = config.run_dir(disease)
+    if model_type == "federated":
+        artifact_root = out_dir / "Federated"
+    else:
+        artifact_root = out_dir
+
+    if not artifact_root.exists():
+        raise FileNotFoundError(f"Run directory does not exist: {artifact_root}")
+
+    metadata_pattern = "metadata__fedavg__*.json" if model_type == "federated" else "metadata__*.json"
+    metadata_files = sorted(artifact_root.glob(metadata_pattern), key=lambda p: p.stat().st_mtime, reverse=True)
     if not metadata_files:
-        raise FileNotFoundError(f"No metadata__*.json found in {out_dir}")
+        raise FileNotFoundError(f"No {metadata_pattern} found in {artifact_root}")
 
     metadata_path = metadata_files[0]
     with open(metadata_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
 
     run_tag = _run_tag_from_metadata(meta)
+    model_tag = f"fedavg__{run_tag}" if model_type == "federated" else run_tag
 
-    model_path = out_dir / f"model__{run_tag}.pt"
-    preds_path = out_dir / f"test_predictions__{run_tag}.csv"
+    model_path = artifact_root / f"model__{model_tag}.pt"
+    preds_path = artifact_root / f"test_predictions__{model_tag}.csv"
 
     if not model_path.exists():
         raise FileNotFoundError(f"Model checkpoint not found: {model_path}")
     if not preds_path.exists():
         raise FileNotFoundError(f"Predictions CSV not found: {preds_path}")
 
-    xai_dir = out_dir / "XAI"
+    xai_dir = artifact_root / "XAI"
     xai_dir.mkdir(parents=True, exist_ok=True)
 
     return model_path, metadata_path, preds_path, xai_dir
@@ -115,7 +302,7 @@ def _build_model_from_checkpoint(ckpt: Dict, device: str) -> GRURisk:
     return model
 
 
-def _get_test_dataset(disease: config.DiseaseSpec, meta: Dict) -> PatientSequenceDataset:
+def _get_test_dataset(disease: config.DiseaseSpec, meta: Dict, samples_path: Optional[str] = None) -> PatientSequenceDataset:
     return PatientSequenceDataset(
         split="test",
         disease=disease,
@@ -124,10 +311,11 @@ def _get_test_dataset(disease: config.DiseaseSpec, meta: Dict) -> PatientSequenc
         normalize=True,
         top_k=meta.get("top_k", None),
         rank_path=str(config.stability_combined_path(config.DISEASE)),
+        samples_path=samples_path,
     )
 
 
-def _get_train_dataset(disease: config.DiseaseSpec, meta: Dict) -> PatientSequenceDataset:
+def _get_train_dataset(disease: config.DiseaseSpec, meta: Dict, samples_path: Optional[str] = None) -> PatientSequenceDataset:
     return PatientSequenceDataset(
         split="train",
         disease=disease,
@@ -136,6 +324,7 @@ def _get_train_dataset(disease: config.DiseaseSpec, meta: Dict) -> PatientSequen
         normalize=True,
         top_k=meta.get("top_k", None),
         rank_path=str(config.stability_combined_path(config.DISEASE)),
+        samples_path=samples_path,
     )
 
 
@@ -154,7 +343,7 @@ def _pad_sequence_to_max_len(x: torch.Tensor, max_len: int) -> torch.Tensor:
 
 
 def _row_activity_lengths(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    active = (x.abs().sum(dim=2) > eps)
+    active = x.abs().sum(dim=2) > eps
     lengths = active.sum(dim=1).clamp(min=1).long()
     return lengths
 
@@ -222,7 +411,7 @@ def _safe_float_or_none(series: pd.Series):
     return float(vals.iloc[0])
 
 
-def _safe_minmax(series: pd.Series) -> Tuple[float | None, float | None]:
+def _safe_minmax(series: pd.Series) -> Tuple[Optional[float], Optional[float]]:
     vals = pd.to_numeric(series, errors="coerce").dropna()
     if len(vals) == 0:
         return None, None
@@ -267,6 +456,141 @@ def _patient_event_info(ds: PatientSequenceDataset, patient_id: int) -> Dict[str
         "lead_time_min": lead_min,
         "lead_time_max": lead_max,
     }
+
+
+def _display_name(feature: str) -> str:
+    return FEATURE_DISPLAY_NAMES.get(feature, feature)
+
+
+def _aggregate_patient_shap_over_time_signed(
+    shap_values_tf: np.ndarray,
+    valid_len: int,
+) -> np.ndarray:
+    return shap_values_tf[:valid_len, :].mean(axis=0)
+
+
+def _aggregate_patient_feature_values_over_time(
+    x_seq: torch.Tensor,
+    valid_len: int,
+) -> np.ndarray:
+    return x_seq[:valid_len, :].detach().cpu().numpy().mean(axis=0)
+
+
+def _build_global_summary_matrices(
+    wrapper: nn.Module,
+    background_x: torch.Tensor,
+    test_ds: PatientSequenceDataset,
+    max_len: int,
+    device: str,
+    max_patients: Optional[int] = None,
+) -> Tuple[np.ndarray, np.ndarray, List[int]]:
+    shap_rows: List[np.ndarray] = []
+    feature_rows: List[np.ndarray] = []
+    patient_ids: List[int] = []
+
+    n = len(test_ds) if max_patients is None else min(len(test_ds), int(max_patients))
+
+    for idx in range(n):
+        x_seq, y_seq, length_t, pid_t = test_ds[idx]
+        length = int(length_t.item())
+        patient_id = int(pid_t.item())
+
+        x_pad = _pad_sequence_to_max_len(x_seq.float(), max_len=max_len).unsqueeze(0).to(device)
+        shap_values_tf = _compute_shap_values(
+            wrapper=wrapper,
+            background_x=background_x,
+            patient_x=x_pad,
+        )
+
+        shap_row = _aggregate_patient_shap_over_time_signed(shap_values_tf, length)
+        feature_row = _aggregate_patient_feature_values_over_time(x_seq.float(), length)
+
+        shap_rows.append(shap_row)
+        feature_rows.append(feature_row)
+        patient_ids.append(patient_id)
+
+    if not shap_rows:
+        raise ValueError("No test patients were available for global SHAP summary generation.")
+
+    shap_mat = np.vstack(shap_rows).astype(np.float64)
+    feature_mat = np.vstack(feature_rows).astype(np.float64)
+    return shap_mat, feature_mat, patient_ids
+
+
+def _rank_features(global_shap_signed_matrix: np.ndarray, feature_names: List[str]) -> pd.DataFrame:
+    mean_abs = np.abs(global_shap_signed_matrix).mean(axis=0)
+    mean_signed = global_shap_signed_matrix.mean(axis=0)
+
+    df = pd.DataFrame(
+        {
+            "feature": feature_names,
+            "display_name": [_display_name(f) for f in feature_names],
+            "mean_abs_shap": mean_abs,
+            "mean_signed_shap": mean_signed,
+        }
+    )
+    df = df.sort_values("mean_abs_shap", ascending=False).reset_index(drop=True)
+    return df
+
+
+def _build_variable_importance_df(feature_ranking_df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+
+    for _, r in feature_ranking_df.iterrows():
+        feature = str(r["feature"])
+        variable = FEATURE_TO_VARIABLE.get(feature, None)
+
+        if variable is None or variable == "EXCLUDE":
+            continue
+
+        group = VARIABLE_TO_GROUP.get(variable, None)
+        if group is None:
+            continue
+
+        rows.append(
+            {
+                "feature": feature,
+                "variable": variable,
+                "group": group,
+                "mean_abs_shap": float(r["mean_abs_shap"]),
+                "mean_signed_shap": float(r["mean_signed_shap"]),
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame(
+            columns=["variable", "group", "mean_abs_shap", "mean_signed_shap", "n_features"]
+        )
+
+    df = pd.DataFrame(rows)
+
+    variable_df = (
+        df.groupby(["variable", "group"], as_index=False)
+        .agg(
+            mean_abs_shap=("mean_abs_shap", "sum"),
+            mean_signed_shap=("mean_signed_shap", "sum"),
+            n_features=("feature", "count"),
+        )
+        .sort_values("mean_abs_shap", ascending=False)
+        .reset_index(drop=True)
+    )
+    return variable_df
+
+
+def _group_shap_importance(variable_importance_df: pd.DataFrame) -> pd.DataFrame:
+    if variable_importance_df.empty:
+        return pd.DataFrame(columns=["group", "group_mean_variable_importance", "n_variables"])
+
+    grouped = (
+        variable_importance_df.groupby("group", as_index=False)
+        .agg(
+            group_mean_variable_importance=("mean_abs_shap", "mean"),
+            n_variables=("variable", "count"),
+        )
+        .sort_values("group_mean_variable_importance", ascending=False)
+        .reset_index(drop=True)
+    )
+    return grouped
 
 
 #############################
@@ -486,6 +810,77 @@ def _plot_temporal_occlusion(
     return save_path
 
 
+def _plot_global_shap_beeswarm(
+    global_shap_signed_matrix: np.ndarray,
+    global_feature_value_matrix: np.ndarray,
+    feature_names: List[str],
+    xai_dir: Path,
+    top_n: int = 15,
+) -> Path:
+    mean_abs = np.abs(global_shap_signed_matrix).mean(axis=0)
+    top_idx = np.argsort(mean_abs)[::-1][:top_n]
+
+    shap_plot_data = global_shap_signed_matrix[:, top_idx]
+    feature_plot_data = global_feature_value_matrix[:, top_idx]
+    plot_feature_names = [_display_name(feature_names[i]) for i in top_idx]
+
+    save_path = xai_dir / f"global_shap_beeswarm_top_{top_n}.png"
+
+    plt.figure(figsize=(10, 6.5))
+    shap.summary_plot(
+        shap_plot_data,
+        features=feature_plot_data,
+        feature_names=plot_feature_names,
+        show=False,
+        plot_size=None,
+    )
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+    return save_path
+
+
+def _plot_global_shap_bar(
+    feature_ranking_df: pd.DataFrame,
+    xai_dir: Path,
+    top_n: int = 15,
+) -> Path:
+    df = feature_ranking_df.head(top_n).iloc[::-1].copy()
+    save_path = xai_dir / f"global_shap_bar_top_{top_n}.png"
+
+    plt.figure(figsize=(10, 6.5))
+    plt.barh(df["display_name"], df["mean_abs_shap"])
+    plt.xlabel("Mean absolute SHAP value")
+    plt.ylabel("")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+    return save_path
+
+
+def _plot_grouped_shap_bar(
+    grouped_df: pd.DataFrame,
+    xai_dir: Path,
+) -> Optional[Path]:
+    if grouped_df.empty:
+        return None
+
+    save_path = xai_dir / "grouped_shap_importance.png"
+    df = grouped_df.iloc[::-1].copy()
+
+    plt.figure(figsize=(9, 5.5))
+    plt.barh(df["group"], df["group_mean_variable_importance"])
+    plt.xlabel("Mean variable importance within group")
+    plt.ylabel("")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+    return save_path
+
+
 #############################
 # Patient selection
 #############################
@@ -495,7 +890,7 @@ def _sample_one(df: pd.DataFrame) -> int:
     return int(df.sample(n=1, random_state=None)["patient_id"].iloc[0])
 
 
-def _choose_patient_id(pred_df: pd.DataFrame) -> int | None:
+def _choose_patient_id(pred_df: pd.DataFrame) -> Optional[int]:
     print()
     print("Choose patient selection mode:")
     print("1) Random TP")
@@ -548,7 +943,12 @@ def main():
     disease = config.DISEASE
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    model_path, metadata_path, preds_path, xai_dir = _infer_artifact_paths(disease)
+    model_type = _choose_model_type()
+    if model_type is None:
+        print("Exiting.")
+        return
+
+    model_path, metadata_path, preds_path, xai_dir = _infer_artifact_paths(disease, model_type=model_type)
     ckpt, meta = _load_checkpoint_and_metadata(model_path, metadata_path, device=device)
     model = _build_model_from_checkpoint(ckpt, device=device)
 
@@ -562,6 +962,7 @@ def main():
     print("========================================")
     print("GRU Explainability CLI")
     print("========================================")
+    print(f"Model type       : {model_type}")
     print(f"Model checkpoint : {model_path}")
     print(f"Metadata         : {metadata_path}")
     print(f"Predictions      : {preds_path}")
@@ -571,8 +972,12 @@ def main():
     print()
 
     print("Loading datasets...")
-    test_ds = _get_test_dataset(disease, meta)
-    train_ds = _get_train_dataset(disease, meta)
+    samples_path = None
+    if model_type == "federated":
+        samples_path = str(config.samples_path(disease))
+
+    test_ds = _get_test_dataset(disease, meta, samples_path=samples_path)
+    train_ds = _get_train_dataset(disease, meta, samples_path=samples_path)
 
     if list(test_ds.feature_cols) != feature_names:
         raise ValueError(
@@ -592,6 +997,59 @@ def main():
 
     wrapper = PatientMaxRiskWrapper(model).to(device)
     wrapper.eval()
+
+    print("Computing global SHAP summaries...")
+    global_shap_signed_matrix, global_feature_value_matrix, global_patient_ids = _build_global_summary_matrices(
+        wrapper=wrapper,
+        background_x=background_x,
+        test_ds=test_ds,
+        max_len=max_len,
+        device=device,
+        max_patients=getattr(config, "SHAP_GLOBAL_MAX_PATIENTS", None),
+    )
+
+    feature_ranking_df = _rank_features(global_shap_signed_matrix, feature_names)
+    feature_ranking_path = xai_dir / "global_shap_feature_ranking.csv"
+    feature_ranking_df.to_csv(feature_ranking_path, index=False)
+
+    variable_importance_df = _build_variable_importance_df(feature_ranking_df)
+    variable_ranking_path = xai_dir / "variable_shap_importance.csv"
+    variable_importance_df.to_csv(variable_ranking_path, index=False)
+
+    grouped_df = _group_shap_importance(variable_importance_df)
+    grouped_path = xai_dir / "grouped_shap_importance.csv"
+    grouped_df.to_csv(grouped_path, index=False)
+
+    global_beeswarm_path = _plot_global_shap_beeswarm(
+        global_shap_signed_matrix=global_shap_signed_matrix,
+        global_feature_value_matrix=global_feature_value_matrix,
+        feature_names=feature_names,
+        xai_dir=xai_dir,
+        top_n=15,
+    )
+
+    global_bar_path = _plot_global_shap_bar(
+        feature_ranking_df=feature_ranking_df,
+        xai_dir=xai_dir,
+        top_n=15,
+    )
+
+    grouped_bar_path = _plot_grouped_shap_bar(
+        grouped_df=grouped_df,
+        xai_dir=xai_dir,
+    )
+
+    print(f"Saved global beeswarm plot : {global_beeswarm_path}")
+    print(f"Saved global bar plot      : {global_bar_path}")
+    if grouped_bar_path is not None:
+        print(f"Saved grouped bar plot     : {grouped_bar_path}")
+    else:
+        print("Grouped bar plot was not created because no grouped features were available.")
+    print(f"Saved full ranking CSV     : {feature_ranking_path}")
+    print(f"Saved variable ranking CSV : {variable_ranking_path}")
+    print(f"Saved grouped ranking CSV  : {grouped_path}")
+    print(f"Global SHAP patients used  : {len(global_patient_ids)}")
+    print()
 
     while True:
         patient_id = _choose_patient_id(pred_df)
