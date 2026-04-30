@@ -1,5 +1,5 @@
 # xai.py
-# CLI explainability tool for the centralized GRU model.
+# Explainability tool for the GRU model.
 #
 # What it does:
 # - loads the saved GRU checkpoint, metadata, and test_predictions.csv
@@ -40,7 +40,7 @@ import torch
 import torch.nn as nn
 
 import config
-from gru_risk import GRURisk
+from gru_model import GRURisk
 from sequence_dataset_gru import PatientSequenceDataset
 
 try:
@@ -72,10 +72,10 @@ FEATURE_DISPLAY_NAMES = {
     "vp_temperature_mean": "Temperature (mean)",
     "vp_temperature_max": "Temperature (max)",
     "vp_temperature_min": "Temperature (min)",
-    "nch_temperature_last": "Temperature nurse-charted (last)",
-    "nch_temperature_mean": "Temperature nurse-charted (mean)",
-    "nch_temperature_min": "Temperature nurse-charted (min)",
-    "nch_temperature_max": "Temperature nurse-charted (max)",
+    "nch_temperature_last": "Temperature (nurse-charted, last)",
+    "nch_temperature_mean": "Temperature (nurse-charted, mean)",
+    "nch_temperature_min": "Temperature (nurse-charted, min)",
+    "nch_temperature_max": "Temperature (nurse-charted, max)",
     "vp_sao2_min": "SpO2 (min)",
     "vp_sao2_mean": "SpO2 (mean)",
     "vp_sao2_last": "SpO2 (last)",
@@ -84,7 +84,7 @@ FEATURE_DISPLAY_NAMES = {
     "va_noninvasivesystolic_max": "SBP (max)",
     "va_noninvasivesystolic_min": "SBP (min)",
     "va_noninvasivesystolic_last": "SBP (last)",
-    "nch_non_invasive_bp_last": "SBP nurse-charted (last)",
+    "nch_non_invasive_bp_last": "SBP (nurse-charted, last)",
     "va_noninvasivemean_last": "MAP (last)",
     "io_nettotal_last": "Net fluid balance (last)",
     "io_nettotal_min": "Net fluid balance (min)",
@@ -100,10 +100,10 @@ FEATURE_DISPLAY_NAMES = {
     "vp_heartrate_mean": "Heart rate (mean)",
     "vp_heartrate_min": "Heart rate (min)",
     "vp_heartrate_max": "Heart rate (max)",
-    "nch_heart_rate_last": "Heart rate nurse-charted (last)",
-    "nch_heart_rate_mean": "Heart rate nurse-charted (mean)",
-    "nch_heart_rate_min": "Heart rate nurse-charted (min)",
-    "nch_heart_rate_max": "Heart rate nurse-charted (max)",
+    "nch_heart_rate_last": "Heart rate (nurse-charted, last)",
+    "nch_heart_rate_mean": "Heart rate (nurse-charted, mean)",
+    "nch_heart_rate_min": "Heart rate (nurse-charted, min)",
+    "nch_heart_rate_max": "Heart rate (nurse-charted, max)",
     "pt_unitvisitnumber": "Unit visit number",
     "nch_glasgow_coma_score_last": "GCS (last)",
     "rch_peep_count": "PEEP count",
@@ -303,27 +303,33 @@ def _build_model_from_checkpoint(ckpt: Dict, device: str) -> GRURisk:
 
 
 def _get_test_dataset(disease: config.DiseaseSpec, meta: Dict, samples_path: Optional[str] = None) -> PatientSequenceDataset:
+    feature_mode = str(meta.get("feature_mode", _feature_mode())).strip().lower()
+    top_k = meta.get("top_k", None) if feature_mode == "all" else None
+    rank_path = str(config.stability_combined_path(disease)) if feature_mode == "all" else None
     return PatientSequenceDataset(
         split="test",
         disease=disease,
         max_len=int(meta["max_len"]),
         seed=int(meta.get("seed", 42)),
         normalize=True,
-        top_k=meta.get("top_k", None),
-        rank_path=str(config.stability_combined_path(config.DISEASE)),
+        top_k=top_k,
+        rank_path=rank_path,
         samples_path=samples_path,
     )
 
 
 def _get_train_dataset(disease: config.DiseaseSpec, meta: Dict, samples_path: Optional[str] = None) -> PatientSequenceDataset:
+    feature_mode = str(meta.get("feature_mode", _feature_mode())).strip().lower()
+    top_k = meta.get("top_k", None) if feature_mode == "all" else None
+    rank_path = str(config.stability_combined_path(disease)) if feature_mode == "all" else None
     return PatientSequenceDataset(
         split="train",
         disease=disease,
         max_len=int(meta["max_len"]),
         seed=int(meta.get("seed", 42)),
         normalize=True,
-        top_k=meta.get("top_k", None),
-        rank_path=str(config.stability_combined_path(config.DISEASE)),
+        top_k=top_k,
+        rank_path=rank_path,
         samples_path=samples_path,
     )
 
@@ -834,6 +840,14 @@ def _plot_global_shap_beeswarm(
         show=False,
         plot_size=None,
     )
+    fig = plt.gcf()
+    axes = fig.axes
+    if axes:
+        axes[0].set_xlabel("SHAP value")
+        axes[0].set_title("SHAP summary plot for GRU model predictions")
+        axes[0].axvline(0, linestyle="--", linewidth=1, color="gray")
+    if len(axes) > 1:
+        axes[-1].set_ylabel("Feature value (low to high)")
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close()
@@ -851,8 +865,9 @@ def _plot_global_shap_bar(
 
     plt.figure(figsize=(10, 6.5))
     plt.barh(df["display_name"], df["mean_abs_shap"])
-    plt.xlabel("Mean absolute SHAP value")
+    plt.xlabel("Mean |SHAP value|")
     plt.ylabel("")
+    plt.title("Global feature importance based on SHAP values (GRU model)")
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close()

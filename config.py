@@ -46,7 +46,7 @@ LEAD_TIME_MINS = 30
 STRIDE_MINS = 60
 
 # Horizon for the label window (primary = 4h)
-HORIZON_HRS = 4
+HORIZON_HRS = 12
 HORIZON_MINS = HORIZON_HRS * 60
 
 # Sequence history rules for GRU inputs
@@ -73,7 +73,7 @@ NODE_ASSIGNMENT_SEED = 42
 #   - "vitals"            -> vitalPeriodic + vitalAperiodic only
 #   - "vitals+demo"       -> vitals + demographics
 #   - "all"               -> whatever your full feature parquet contains
-FEATURE_MODE = "all"
+FEATURE_MODE = "vitals+demo"
 
 #############################
 # Optional: cap total windows by sampling patients
@@ -134,7 +134,7 @@ NEG_POS_MAX_RATIO = 10.0
 NEG_LIMITER_RANDOM_STATE = 42
 
 
-USE_POS_WEIGHT = True
+USE_POS_WEIGHT = False
 POS_WEIGHT_MAX = 500.0
 
 FS_MAX_TRAIN_ROWS = 70000
@@ -155,7 +155,8 @@ SCALE_NUMERIC = True
 #############################
 # Feature selection (Top-K)
 #############################
-TOPK_LIST: List[int] = [20, 40, 60, 80, 100]
+DEFAULT_TOPK = 60
+TOPK_LIST: List[int] = [DEFAULT_TOPK]
 
 
 #############################

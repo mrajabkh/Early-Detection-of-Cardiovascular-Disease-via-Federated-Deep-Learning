@@ -11,13 +11,14 @@ from torch.utils.data import DataLoader
 
 import config
 import xai
-from fed_train_eval import _write_node_samples_csvs
-from gru_risk import GRURisk
+from run_federated import _write_node_samples_csvs
+from gru_model import GRURisk
 from sequence_dataset_gru import PatientSequenceDataset, pad_collate
 from train_eval_gru import (
     TrainConfig,
     evaluate,
     masked_focal_loss,
+    _resolve_pos_weight,
     _flatten_loader_probs,
     _model_forward_logits_ts,
     _pick_threshold_max_f1,
@@ -138,8 +139,8 @@ def _build_loader(split: str, samples_path: Path, cfg: TrainConfig) -> DataLoade
         max_len=cfg.max_len,
         seed=cfg.seed,
         normalize=True,
-        top_k=None,
-        rank_path=None,
+        top_k=int(getattr(config, "DEFAULT_TOPK", 60)),
+        rank_path=str(config.stability_combined_path(config.DISEASE)),
         samples_path=samples_path,
     )
     return DataLoader(ds, batch_size=cfg.batch_size, shuffle=(split == "train"), collate_fn=pad_collate)
@@ -161,6 +162,7 @@ def _train_local_node(train_samples_path: Path, cfg: TrainConfig) -> Dict[str, o
     ).to(cfg.device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    pos_weight = _resolve_pos_weight(train_loader, cfg.device)
     best_val_auroc = -1.0
     best_state = None
     bad_epochs = 0
@@ -175,7 +177,7 @@ def _train_local_node(train_samples_path: Path, cfg: TrainConfig) -> Dict[str, o
             optimizer.zero_grad()
             out = model(x, lengths)
             logits_ts = _model_forward_logits_ts(out)
-            loss = masked_focal_loss(logits_ts, y, mask, gamma=2.0, alpha=None, pos_weight=None)
+            loss = masked_focal_loss(logits_ts, y, mask, gamma=2.0, alpha=None, pos_weight=pos_weight)
             loss.backward()
             optimizer.step()
 

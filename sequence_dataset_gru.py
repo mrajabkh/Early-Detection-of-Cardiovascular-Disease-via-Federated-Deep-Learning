@@ -5,11 +5,11 @@
 # Uses the 'split' column in samples.csv to match your ML pipeline.
 # Enforces patient-level splitting: a patient must not appear in multiple splits.
 #
-# IMPORTANT:
+# Important:
 # - If samples.csv includes 't_event' and 'lead_time_mins', we keep them in df for evaluation,
-#   but we EXCLUDE them from model features so they are not normalized or used as inputs.
+#   but exclude them from model features so they are not normalized or used as inputs.
 #
-# FEATURE MODE SUPPORT:
+# Feature mode support:
 # - config.FEATURE_MODE == "all"
 #     -> load full feature parquet
 # - config.FEATURE_MODE == "vitals"
@@ -17,19 +17,19 @@
 # - config.FEATURE_MODE == "vitals+demo"
 #     -> load vitals parquet + full baseline parquet
 #
-# MEMORY FIX:
+# Memory behavior:
 # - If top_k is provided, we only load ["patientunitstayid", "t_end"] + top_k ranked feature columns
 #   from the full features parquet. This prevents loading a huge wide dataframe into RAM.
 # - top_k / rank_path are only valid when FEATURE_MODE == "all"
 #
-# ROBUSTNESS FIX:
+# Robustness:
 # - If rank CSV contains feature names not present in features.parquet (e.g. *_missing),
 #   we filter them out using the parquet schema (without reading the full dataset).
 #
-# NEW (federation support):
+# Federation support:
 # - PatientSequenceDataset accepts samples_path override so each node can point to its own samples CSV.
 #
-# NEW (XAI support):
+# XAI support:
 # - Each dataset item now also returns patientunitstayid so downstream code can save
 #   patient-level predictions for explainability.
 

@@ -1,6 +1,5 @@
-# gru_risk.py
+# gru_model.py
 # Simple supervised GRU for early detection on windowed time series
-# NEW:
 # - Optional LayerNorm on GRU outputs
 # - Optional attention pooling head (auxiliary) for interpretability / sequence summary
 
@@ -16,7 +15,7 @@ class GRURisk(nn.Module):
     Input:  (B, T, D)
 
     Main output:
-      logits_ts: (B, T)  per-timestep logits (unchanged pipeline)
+      logits_ts: (B, T)  per-timestep logits
 
     Optional attention pooling head (for XAI + optional auxiliary loss):
       attn_weights: (B, T) attention over timesteps

@@ -1,4 +1,4 @@
-# fed_train_eval.py
+# run_federated.py
 # Simulated Federated Learning (FedAvg) for your GRU early detection model.
 #
 # Requirements in your run folder (config.run_dir(disease)):
@@ -28,14 +28,15 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 import config
-from gru_risk import GRURisk
+from gru_model import GRURisk
 from sequence_dataset_gru import PatientSequenceDataset, pad_collate
 
-# Reuse your existing training/eval utilities exactly
+# Reuse the shared training and evaluation utilities
 from train_eval_gru import (
     TrainConfig,
     evaluate,
     masked_focal_loss,
+    _resolve_pos_weight,
     _model_forward_logits_ts,
     _model_forward_logit_seq,
     _compute_seq_targets,
@@ -51,9 +52,9 @@ from train_eval_gru import (
 )
 
 # Centralized benchmark metrics for comparison in federated plots.
-# Update these values with your centralized model results.
-CENTRALIZED_AUROC: float | None = 0.887
-CENTRALIZED_AUPRC: float | None = 0.645
+# These should match the latest centralized 4-hour GRU rerun.
+CENTRALIZED_AUROC: float | None = 0.888
+CENTRALIZED_AUPRC: float | None = 0.650
 
 
 @dataclass
@@ -150,49 +151,85 @@ def _save_fed_history_plot(
     out_dir: Path,
     centralized_auroc: float | None = None,
     centralized_auprc: float | None = None,
-) -> Path:
+) -> Tuple[Dict[str, str], Path]:
     if not history_rows:
         raise ValueError("Federated history is empty.")
 
     df = pd.DataFrame(history_rows)
     rounds = df["round"].tolist()
+    loss = df["val_loss"].tolist()
+    accuracy = df["val_accuracy"].tolist()
     auroc = df["val_auroc"].tolist()
     auprc = df["val_auprc"].tolist()
 
-    save_path = out_dir / "fedavg_validation_history.png"
+    csv_path = out_dir / "fedavg_validation_history.csv"
+    df.to_csv(csv_path, index=False)
+    plot_paths = {
+        "loss": str(out_dir / "fedavg_validation_loss.png"),
+        "accuracy": str(out_dir / "fedavg_validation_accuracy.png"),
+        "auroc": str(out_dir / "fedavg_validation_auroc.png"),
+        "auprc": str(out_dir / "fedavg_validation_auprc.png"),
+    }
 
-    plt.figure(figsize=(10, 5))
-    plt.plot(rounds, auroc, marker="o", linewidth=2, label="Federated AUROC")
-    plt.plot(rounds, auprc, marker="s", linewidth=2, label="Federated AUPRC")
+    plt.figure(figsize=(7, 5))
+    plt.plot(rounds, loss, marker="o", linewidth=2, color="tab:red")
+    plt.xlabel("Federated round")
+    plt.ylabel("Loss")
+    plt.title("Validation loss across communication rounds")
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(plot_paths["loss"], dpi=200)
+    plt.close()
 
+    plt.figure(figsize=(7, 5))
+    plt.plot(rounds, accuracy, marker="o", linewidth=2, color="tab:green")
+    plt.xlabel("Federated round")
+    plt.ylabel("Accuracy")
+    plt.title("Validation accuracy across communication rounds")
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(plot_paths["accuracy"], dpi=200)
+    plt.close()
+
+    plt.figure(figsize=(7, 5))
+    plt.plot(rounds, auroc, marker="o", linewidth=2, label="Federated")
     if centralized_auroc is not None:
         plt.axhline(
             centralized_auroc,
             color="gray",
             linestyle="--",
             linewidth=1.5,
-            label=f"Centralized AUROC = {centralized_auroc:.3f}",
+            label="Centralised baseline",
         )
+    plt.xlabel("Federated round")
+    plt.ylabel("AUROC")
+    plt.title("Validation AUROC across communication rounds")
+    plt.grid(alpha=0.3)
+    plt.legend(loc="best")
+    plt.tight_layout()
+    plt.savefig(plot_paths["auroc"], dpi=200)
+    plt.close()
 
+    plt.figure(figsize=(7, 5))
+    plt.plot(rounds, auprc, marker="s", linewidth=2, color="tab:orange", label="Federated")
     if centralized_auprc is not None:
         plt.axhline(
             centralized_auprc,
             color="tab:orange",
             linestyle="--",
             linewidth=1.5,
-            label=f"Centralized AUPRC = {centralized_auprc:.3f}",
+            label="Centralised baseline",
         )
-
     plt.xlabel("Federated round")
-    plt.ylabel("Metric")
-    plt.title("Federated validation performance vs centralized benchmark")
+    plt.ylabel("AUPRC")
+    plt.title("Validation AUPRC across communication rounds")
     plt.grid(alpha=0.3)
     plt.legend(loc="best")
     plt.tight_layout()
-    plt.savefig(save_path, dpi=200)
+    plt.savefig(plot_paths["auprc"], dpi=200)
     plt.close()
 
-    return save_path
+    return plot_paths, csv_path
 
 
 def _local_train_one_client(
@@ -200,6 +237,7 @@ def _local_train_one_client(
     train_loader: DataLoader,
     cfg: TrainConfig,
     local_epochs: int,
+    pos_weight: torch.Tensor | None,
 ) -> None:
     model.train()
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
@@ -221,7 +259,7 @@ def _local_train_one_client(
                 mask,
                 gamma=2.0,
                 alpha=None,
-                pos_weight=None,
+                pos_weight=pos_weight,
             )
             loss = loss_ts
 
@@ -246,12 +284,13 @@ def train_and_eval_fedavg(
     fed: FedConfig,
     top_k: int | None = None,
     rank_path: str | None = None,
+    samples_path: str | Path | None = None,
 ) -> Dict[str, Any]:
     _seed_everything(fed.seed)
     rng = np.random.default_rng(int(fed.seed))
 
     run_dir = config.run_dir(disease)
-    samples_csv = config.samples_path(disease)
+    samples_csv = Path(samples_path) if samples_path is not None else config.samples_path(disease)
     if not samples_csv.exists():
         raise FileNotFoundError(
             f"Missing {samples_csv}.\n"
@@ -325,6 +364,7 @@ def train_and_eval_fedavg(
                 samples_path=node_csv_paths[int(nid)],
             )
             train_loader = DataLoader(train_ds, cfg.batch_size, True, collate_fn=pad_collate)
+            pos_weight = _resolve_pos_weight(train_loader, cfg.device)
 
             local_model = GRURisk(
                 input_dim=len(train_ds.feature_cols),
@@ -337,7 +377,7 @@ def train_and_eval_fedavg(
 
             local_model.load_state_dict(model_global.state_dict())
 
-            _local_train_one_client(local_model, train_loader, cfg, fed.local_epochs)
+            _local_train_one_client(local_model, train_loader, cfg, fed.local_epochs, pos_weight)
 
             local_states.append({k: v.detach().cpu().clone() for k, v in local_model.state_dict().items()})
             local_weights.append(float(node_train_sizes[int(nid)]))
@@ -350,16 +390,30 @@ def train_and_eval_fedavg(
         model_global.load_state_dict(new_state)
 
         val_metrics = evaluate(model_global, val_loader, cfg.device)
+        yv_true, yv_prob = _flatten_loader_probs(model_global, val_loader, device=cfg.device)
         va = float(val_metrics.get("auroc", float("nan")))
         vp = float(val_metrics.get("auprc", float("nan")))
+        vl = float(val_metrics.get("loss", float("nan")))
+        vacc = float("nan") if yv_true.size == 0 else float(_threshold_metrics(yv_true, yv_prob, 0.5)["accuracy"])
 
-        history_rows.append({"round": float(r + 1), "val_auroc": va, "val_auprc": vp})
+        history_rows.append(
+            {
+                "round": float(r + 1),
+                "val_loss": vl,
+                "val_accuracy": vacc,
+                "val_auroc": va,
+                "val_auprc": vp,
+            }
+        )
 
         if np.isfinite(va) and va > best_val_auroc:
             best_val_auroc = va
             best_state = {k: v.detach().cpu().clone() for k, v in model_global.state_dict().items()}
 
-        print(f"[Round {r+1}/{fed.rounds}] val_auroc={va:.4f} val_auprc={vp:.4f}")
+        print(
+            f"[Round {r+1}/{fed.rounds}] "
+            f"val_loss={vl:.4f} val_acc={vacc:.4f} val_auroc={va:.4f} val_auprc={vp:.4f}"
+        )
 
     if best_state is not None:
         model_global.load_state_dict(best_state)
@@ -414,7 +468,7 @@ def train_and_eval_fedavg(
         test_pred_df=test_pred_df,
     )
 
-    history_plot_path = _save_fed_history_plot(
+    history_plot_paths, history_csv_path = _save_fed_history_plot(
         history_rows=history_rows,
         out_dir=cache_dir,
         centralized_auroc=CENTRALIZED_AUROC,
@@ -439,7 +493,8 @@ def train_and_eval_fedavg(
         "threshold": float(chosen_threshold),
         "curve_paths": curve_paths,
         "artifact_paths": artifact_paths,
-        "history_plot_path": str(history_plot_path),
+        "history_plot_paths": history_plot_paths,
+        "history_csv_path": str(history_csv_path),
         "history": history_rows,
         "n_features": int(len(val_ds.feature_cols)),
     }
@@ -616,14 +671,20 @@ if __name__ == "__main__":
         seed=42,
     )
 
-    top_k = None
-    rank_path = None
+    feature_mode = _feature_mode()
+    if feature_mode == "all":
+        top_k = int(getattr(config, "DEFAULT_TOPK", 60))
+        rank_path = str(config.stability_combined_path(disease))
+    else:
+        top_k = None
+        rank_path = None
 
     print("============================================================")
     print("Federated GRU (FedAvg) run")
     print("Disease:", getattr(disease, "name", str(disease)))
     print("Run dir:", config.run_dir(disease))
     print("Device:", cfg.device)
+    print("Feature mode:", feature_mode)
     print(f"Rounds={fed.rounds}  LocalEpochs={fed.local_epochs}  LR={cfg.lr}")
     print("============================================================")
 

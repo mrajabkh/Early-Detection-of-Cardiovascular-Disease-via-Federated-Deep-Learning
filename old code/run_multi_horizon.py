@@ -5,7 +5,7 @@
 #  1) prepare_data.py
 #  2) aggregate_features.py
 #  3) feature_selection_stability.py
-#  4) run_gru_sweep.py
+#  4) run_centralized.py
 #
 # Notes:
 # - This script edits config.py in-place to set HORIZON_HRS, then restores it at the end.
@@ -43,7 +43,7 @@ CONFIG_PATH = CODE_DIR / "config.py"
 PREPARE_DATA_PATH = CODE_DIR / "prepare_data.py"
 AGG_FEATURES_PATH = CODE_DIR / "aggregate_features.py"
 FEATSEL_PATH = CODE_DIR / "feature_selection_stability.py"
-GRU_SWEEP_PATH = CODE_DIR / "run_gru_sweep.py"
+GRU_SWEEP_PATH = CODE_DIR / "run_centralized.py"
 
 
 #############################

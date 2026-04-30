@@ -1,4 +1,4 @@
-# run_gru_sweep.py
+# run_centralized.py
 # Run GRU experiments with feature-mode aware logic.
 #
 # Behavior:

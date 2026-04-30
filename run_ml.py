@@ -1,12 +1,9 @@
-# run_topk_models.py
+# run_ml.py
 # Run baseline ML models on Top-K selected features and save results into Outputs/<run_name>/.
 # Uses the patient-level split already stored in samples.csv (split column).
 # Ranking: stability_combined only (no SHAP fallback).
 # Optional: peak RAM via memory_profiler if installed.
-#
-# NOTE (quick hack): Only outputs TEST split rows (no VAL/TRAIN rows written).
-#
-# Location: Project/Code/run_topk_models.py
+# Only outputs TEST split rows (no VAL/TRAIN rows written).
 
 from __future__ import annotations
 

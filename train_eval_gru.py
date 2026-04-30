@@ -3,25 +3,21 @@
 # Reports AUROC and AUPRC on train/val/test splits.
 # Saves ROC and PR curves for the TEST split.
 #
-# NEW:
-# - Uses pos_weight in BCEWithLogitsLoss during TRAINING to handle class imbalance.
+# - Supports optional pos_weight during training to handle class imbalance.
 # - pos_weight computed from TRAIN split masked labels: n_neg / n_pos
 # - Optional clipping via config.POS_WEIGHT_MAX (if not present, no clipping).
 #
-# NEW (metrics parity with ML table, but only for TEST):
+# Test-set threshold metrics:
 # - Selects a classification threshold on the VALIDATION split by maximizing F1.
 # - Applies that fixed threshold to TEST to compute: Accuracy, Precision, Recall, F1,
 #   confusion matrix (TN/FP/FN/TP) and FPR.
 #
-# NEW (focal loss):
 # - Training uses masked focal loss on per-timestep logits.
 #
-# NEW (attention pooling aux head):
 # - Model may return dict containing logits_ts and optional logit_seq.
 # - If logit_seq exists, we can add an auxiliary sequence-level loss.
-#   This gives you attention weights for XAI later without changing evaluation.
+#   This preserves attention weights for XAI without changing evaluation.
 #
-# NEW (XAI prep):
 # - Saves trained model checkpoint to the normal output folder from config.
 # - Saves metadata.json with feature names and model config.
 # - Saves test_predictions.csv with one row per patient so explainability can
@@ -33,6 +29,8 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple
 import json
 import time
+import shutil
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -44,7 +42,7 @@ import matplotlib.pyplot as plt
 
 import config
 from sequence_dataset_gru import PatientSequenceDataset, pad_collate
-from gru_risk import GRURisk
+from gru_model import GRURisk
 
 try:
     from memory_profiler import memory_usage
@@ -375,6 +373,13 @@ def _compute_pos_weight_from_loader(train_loader: DataLoader, device: str) -> to
     return torch.tensor([pw], dtype=torch.float32, device=device)
 
 
+def _resolve_pos_weight(train_loader: DataLoader, device: str) -> torch.Tensor | None:
+    use_pos_weight = bool(getattr(config, "USE_POS_WEIGHT", False))
+    if not use_pos_weight:
+        return None
+    return _compute_pos_weight_from_loader(train_loader, device)
+
+
 #############################
 # Config
 #############################
@@ -382,8 +387,8 @@ def _compute_pos_weight_from_loader(train_loader: DataLoader, device: str) -> to
 class TrainConfig:
     max_len: int = 128
     batch_size: int = 32
-    hidden_dim: int = 128
-    num_layers: int = 1
+    hidden_dim: int = 128 #256
+    num_layers: int = 1 #2
     dropout: float = 0.2
     lr: float = 1e-3
     weight_decay: float = 1e-5
@@ -466,23 +471,30 @@ def _save_test_curves(
 
     roc_path = str(curves_dir / f"roc_test__{run_tag}.png")
     pr_path = str(curves_dir / f"pr_test__{run_tag}.png")
+    pr_baseline = float((y_true == 1).mean())
 
     fpr, tpr = _roc_curve_manual(y_true, y_prob)
-    plt.figure()
-    plt.plot(fpr, tpr)
-    plt.xlabel("False Positive Rate")
-    plt.ylabel("True Positive Rate")
-    plt.title(f"ROC curve (TEST, {run_tag})")
+    plt.figure(figsize=(6.5, 5))
+    plt.plot(fpr, tpr, linewidth=2)
+    plt.plot([0, 1], [0, 1], linestyle="--", linewidth=1.5, color="gray")
+    plt.xlabel("False Positive Rate", fontsize=12)
+    plt.ylabel("True Positive Rate", fontsize=12)
+    plt.title("ROC Curve (Centralised 4-hour GRU)", fontsize=13)
+    plt.xlim(0, 1)
+    plt.ylim(0, 1)
     plt.tight_layout()
     plt.savefig(roc_path, dpi=200)
     plt.close()
 
     recall, precision = _precision_recall_curve_manual(y_true, y_prob)
-    plt.figure()
-    plt.plot(recall, precision)
-    plt.xlabel("Recall")
-    plt.ylabel("Precision")
-    plt.title(f"PR curve (TEST, {run_tag})")
+    plt.figure(figsize=(6.5, 5))
+    plt.plot(recall, precision, linewidth=2)
+    plt.axhline(y=pr_baseline, linestyle="--", linewidth=1.5, color="gray")
+    plt.xlabel("Recall", fontsize=12)
+    plt.ylabel("Precision", fontsize=12)
+    plt.title("Precision-Recall Curve (Centralised 4-hour GRU)", fontsize=13)
+    plt.xlim(0, 1)
+    plt.ylim(0, 1)
     plt.tight_layout()
     plt.savefig(pr_path, dpi=200)
     plt.close()
@@ -628,6 +640,7 @@ def train_and_eval(
     cfg: TrainConfig,
     top_k: int | None = None,
     rank_path: str | None = None,
+    samples_path: str | None = None,
 ) -> Dict[str, Dict]:
 
     t0 = time.perf_counter()
@@ -641,6 +654,7 @@ def train_and_eval(
             normalize=True,
             top_k=top_k,
             rank_path=rank_path,
+            samples_path=samples_path,
         )
         val_ds = PatientSequenceDataset(
             split="val",
@@ -650,6 +664,7 @@ def train_and_eval(
             normalize=True,
             top_k=top_k,
             rank_path=rank_path,
+            samples_path=samples_path,
         )
         test_ds = PatientSequenceDataset(
             split="test",
@@ -659,11 +674,13 @@ def train_and_eval(
             normalize=True,
             top_k=top_k,
             rank_path=rank_path,
+            samples_path=samples_path,
         )
 
         train_loader = DataLoader(train_ds, cfg.batch_size, True, collate_fn=pad_collate)
         val_loader = DataLoader(val_ds, cfg.batch_size, False, collate_fn=pad_collate)
         test_loader = DataLoader(test_ds, cfg.batch_size, False, collate_fn=pad_collate)
+        pos_weight = _resolve_pos_weight(train_loader, cfg.device)
 
         model = GRURisk(
             input_dim=len(train_ds.feature_cols),
@@ -698,7 +715,7 @@ def train_and_eval(
                     mask,
                     gamma=2.0,
                     alpha=None,
-                    pos_weight=None,
+                    pos_weight=pos_weight,
                 )
 
                 loss = loss_ts
@@ -790,7 +807,7 @@ def train_and_eval(
             "feature_mode": _feature_mode(),
             "curve_paths": curve_paths,
             "artifact_paths": artifact_paths,
-            "pos_weight": None,
+            "pos_weight": (float(pos_weight.item()) if pos_weight is not None else None),
         }
 
     if memory_usage is not None:
