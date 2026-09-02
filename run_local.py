@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import time
 from pathlib import Path
 from typing import Dict, Optional
 
+import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
@@ -28,9 +31,14 @@ from train_eval_gru import (
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate a selected node using saved centralized and federated GRU checkpoints."
+        description="Train local GRUs for all nodes or one selected node."
     )
-    parser.add_argument("--node", type=int, default=2, help="Node id to evaluate (default: 2)")
+    parser.add_argument(
+        "--node",
+        type=int,
+        default=None,
+        help="Run one node; omission runs every node sequentially.",
+    )
     parser.add_argument(
         "--samples-with-node",
         type=Path,
@@ -42,6 +50,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=20, help="Local node training epochs")
     parser.add_argument("--batch-size", type=int, default=32, help="Local node batch size")
     parser.add_argument("--output-dir", type=Path, default=None, help="Optional output directory for JSON results")
+    parser.add_argument(
+        "--compare-saved",
+        action="store_true",
+        help="Also evaluate saved centralized/federated GRUs on every node.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Retrain nodes already present in local_gru_results.csv.",
+    )
     return parser.parse_args()
 
 
@@ -91,14 +109,17 @@ def _load_saved_model(model_type: str, device: str) -> Optional[Dict[str, object
 
 
 def _build_dataset_from_meta(split: str, samples_path: Path, meta: Dict, cfg: TrainConfig) -> PatientSequenceDataset:
+    feature_mode = str(getattr(config, "FEATURE_MODE", "all")).strip().lower()
+    top_k = meta.get("top_k", None) if feature_mode == "all" else None
+    rank_path = str(config.stability_combined_path(config.DISEASE)) if top_k is not None else None
     return PatientSequenceDataset(
         split=split,
         disease=config.DISEASE,
         max_len=int(meta["max_len"]),
         seed=int(meta.get("seed", cfg.seed)),
         normalize=True,
-        top_k=meta.get("top_k", None),
-        rank_path=str(config.stability_combined_path(config.DISEASE)),
+        top_k=top_k,
+        rank_path=rank_path,
         samples_path=samples_path,
     )
 
@@ -133,14 +154,22 @@ def _evaluate_saved_model(saved: Dict[str, object], samples_path: Path, cfg: Tra
 
 
 def _build_loader(split: str, samples_path: Path, cfg: TrainConfig) -> DataLoader:
+    feature_mode = str(getattr(config, "FEATURE_MODE", "all")).strip().lower()
+    if feature_mode == "all":
+        top_k = int(getattr(config, "DEFAULT_TOPK", 60))
+        rank_path = str(config.stability_combined_path(config.DISEASE))
+    else:
+        top_k = None
+        rank_path = None
+
     ds = PatientSequenceDataset(
         split=split,
         disease=config.DISEASE,
         max_len=cfg.max_len,
         seed=cfg.seed,
         normalize=True,
-        top_k=int(getattr(config, "DEFAULT_TOPK", 60)),
-        rank_path=str(config.stability_combined_path(config.DISEASE)),
+        top_k=top_k,
+        rank_path=rank_path,
         samples_path=samples_path,
     )
     return DataLoader(ds, batch_size=cfg.batch_size, shuffle=(split == "train"), collate_fn=pad_collate)
@@ -229,15 +258,13 @@ def main() -> None:
     if not samples_with_node.exists():
         raise FileNotFoundError(f"Missing samples file: {samples_with_node.resolve()}")
 
-    node_id = args.node
     node_csv_paths = _node_csv_paths(samples_with_node)
-    if node_id not in node_csv_paths:
-        raise ValueError(f"Node {node_id} not found. Available nodes: {sorted(node_csv_paths.keys())}")
-
-    node_samples = node_csv_paths[node_id]
-    print(f"Selected node: {node_id}")
-    print(f"Node-specific samples: {node_samples}")
-    print(f"Full centralized samples: {samples_with_node}\n")
+    selected_nodes = sorted(node_csv_paths) if args.node is None else [args.node]
+    missing_nodes = [node_id for node_id in selected_nodes if node_id not in node_csv_paths]
+    if missing_nodes:
+        raise ValueError(
+            f"Node(s) {missing_nodes} not found. Available nodes: {sorted(node_csv_paths.keys())}"
+        )
 
     cfg = TrainConfig(
         epochs=args.epochs,
@@ -245,61 +272,92 @@ def main() -> None:
         device="cuda" if torch.cuda.is_available() else "cpu",
     )
 
-    results: Dict[str, object] = {
-        "node_id": node_id,
-        "samples_with_node": str(samples_with_node.resolve()),
-        "node_samples": str(node_samples.resolve()),
-        "device": cfg.device,
-        "config": {
-            "epochs": cfg.epochs,
-            "batch_size": cfg.batch_size,
-            "lr": cfg.lr,
-            "weight_decay": cfg.weight_decay,
-            "hidden_dim": cfg.hidden_dim,
-            "num_layers": cfg.num_layers,
-            "dropout": cfg.dropout,
-        },
-        "runs": [],
-    }
+    output_dir = args.output_dir or (config.run_dir(config.DISEASE) / "GRU" / "Local")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = output_dir / "local_gru_results.csv"
+    existing = pd.read_csv(summary_path) if summary_path.exists() else pd.DataFrame()
+    if args.node is None and not args.force and "node_id" in existing.columns:
+        completed_nodes = set(existing["node_id"].astype(int).tolist())
+        selected_nodes = [node_id for node_id in selected_nodes if node_id not in completed_nodes]
+        if completed_nodes:
+            print(f"Skipping completed nodes already in CSV: {sorted(completed_nodes)}")
+    new_rows = []
 
-    print("Running local node-only model (trained from scratch)...\n")
-    local_result = _train_local_node(node_samples, cfg)
-    results["runs"].append(local_result)
+    for node_id in selected_nodes:
+        node_samples = node_csv_paths[node_id]
+        print(f"Selected node: {node_id}")
+        print(f"Node-specific samples: {node_samples}")
+        print(f"Full centralized samples: {samples_with_node}\n")
 
-    centralized_saved = _load_saved_model("centralized", cfg.device)
-    if centralized_saved is not None:
-        print("Evaluating saved centralized model on node data...\n")
-        results["runs"].append(_evaluate_saved_model(centralized_saved, node_samples, cfg))
-    else:
-        print("Skipping centralized saved model because no checkpoint was found.\n")
+        random.seed(cfg.seed)
+        np.random.seed(cfg.seed)
+        torch.manual_seed(cfg.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(cfg.seed)
 
-    federated_saved = _load_saved_model("federated", cfg.device)
-    if federated_saved is not None:
-        print("Evaluating saved federated model on node data...\n")
-        results["runs"].append(_evaluate_saved_model(federated_saved, node_samples, cfg))
-    else:
-        print("Skipping federated saved model because no checkpoint was found.\n")
+        results: Dict[str, object] = {
+            "node_id": node_id,
+            "samples_with_node": str(samples_with_node.resolve()),
+            "node_samples": str(node_samples.resolve()),
+            "device": cfg.device,
+            "config": {
+                "epochs": cfg.epochs,
+                "batch_size": cfg.batch_size,
+                "lr": cfg.lr,
+                "weight_decay": cfg.weight_decay,
+                "hidden_dim": cfg.hidden_dim,
+                "num_layers": cfg.num_layers,
+                "dropout": cfg.dropout,
+            },
+            "runs": [],
+        }
 
-    if args.output_dir:
-        args.output_dir.mkdir(parents=True, exist_ok=True)
-        out_path = args.output_dir / f"node_{node_id}_comparison.json"
+        print("Running local node-only model (trained from scratch)...\n")
+        local_result = _train_local_node(node_samples, cfg)
+        results["runs"].append(local_result)
+
+        if args.compare_saved:
+            centralized_saved = _load_saved_model("centralized", cfg.device)
+            if centralized_saved is not None:
+                print("Evaluating saved centralized model on node data...\n")
+                results["runs"].append(_evaluate_saved_model(centralized_saved, node_samples, cfg))
+
+            federated_saved = _load_saved_model("federated", cfg.device)
+            if federated_saved is not None:
+                print("Evaluating saved federated model on node data...\n")
+                results["runs"].append(_evaluate_saved_model(federated_saved, node_samples, cfg))
+
+        out_path = output_dir / f"node_{node_id}_comparison.json"
         with out_path.open("w", encoding="utf-8") as f:
             json.dump(results, f, indent=2)
-        print(f"Saved results to {out_path.resolve()}")
 
-    print("\nSummary:\n")
-    for run in results["runs"]:
-        print(f"== {run['label']} ==")
-        if run.get("model_path"):
-            print(f"  model_path: {run['model_path']}")
-        print(f"  val AUROC:  {run['val']['auroc']:.4f}")
-        print(f"  val AUPRC:  {run['val']['auprc']:.4f}")
-        print(f"  test AUROC: {run['test']['auroc']:.4f}")
-        print(f"  test AUPRC: {run['test']['auprc']:.4f}")
-        if run["test_threshold_metrics"]:
-            print(f"  test F1:    {run['test_threshold_metrics']['f1']:.4f}")
-            print(f"  test acc:   {run['test_threshold_metrics']['accuracy']:.4f}")
-        print("")
+        tm = local_result["test_threshold_metrics"]
+        new_rows.append(
+            {
+                "node_id": node_id,
+                "train_auroc": local_result["train"]["auroc"],
+                "train_auprc": local_result["train"]["auprc"],
+                "val_auroc": local_result["val"]["auroc"],
+                "val_auprc": local_result["val"]["auprc"],
+                "test_auroc": local_result["test"]["auroc"],
+                "test_auprc": local_result["test"]["auprc"],
+                "threshold": local_result["threshold"],
+                "test_accuracy": tm.get("accuracy", float("nan")),
+                "test_precision": tm.get("precision", float("nan")),
+                "test_recall": tm.get("recall", float("nan")),
+                "test_f1": tm.get("f1", float("nan")),
+                "test_fpr": tm.get("fpr", float("nan")),
+            }
+        )
+        combined = pd.concat([existing, pd.DataFrame(new_rows)], ignore_index=True)
+        combined = combined.drop_duplicates(subset=["node_id"], keep="last").sort_values("node_id")
+        combined.to_csv(summary_path, index=False)
+
+        print(f"Saved node results to {out_path.resolve()}")
+        print(f"Node {node_id} test AUROC: {local_result['test']['auroc']:.4f}")
+        print(f"Node {node_id} test AUPRC: {local_result['test']['auprc']:.4f}\n")
+
+    print(f"Saved consolidated local GRU results to: {summary_path.resolve()}")
 
 
 if __name__ == "__main__":
