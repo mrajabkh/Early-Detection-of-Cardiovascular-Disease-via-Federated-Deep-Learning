@@ -178,7 +178,8 @@ def _select_feature_columns(df: pd.DataFrame) -> List[str]:
 
 def _compute_norm_stats(df: pd.DataFrame, feature_cols: List[str]) -> Tuple[np.ndarray, np.ndarray]:
     x = df[feature_cols].to_numpy(dtype=np.float32)
-    x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    if not np.isfinite(x).all():
+        raise ValueError("Non-finite values reached normalization after imputation.")
     mean = x.mean(axis=0)
     std = x.std(axis=0)
     std = np.where(std < 1e-6, 1.0, std)
@@ -187,7 +188,8 @@ def _compute_norm_stats(df: pd.DataFrame, feature_cols: List[str]) -> Tuple[np.n
 
 def _apply_norm(df: pd.DataFrame, feature_cols: List[str], mean: np.ndarray, std: np.ndarray) -> None:
     x = df[feature_cols].to_numpy(dtype=np.float32)
-    x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    if not np.isfinite(x).all():
+        raise ValueError("Non-finite values reached normalization after imputation.")
     x = (x - mean[None, :]) / std[None, :]
     df.loc[:, feature_cols] = x
 
@@ -244,9 +246,12 @@ def _load_features_for_mode(
     feature_mode: str,
     top_k: Optional[int],
     rank_path: Optional[str],
+    features_dir: Optional[Union[str, Path]] = None,
 ) -> pd.DataFrame:
+    base_dir = Path(features_dir) if features_dir is not None else None
+    tag = config.disease_tag(disease)
     if feature_mode == "all":
-        features_path = str(config.features_path(disease))
+        features_path = str(base_dir / f"features__{tag}.parquet" if base_dir else config.features_path(disease))
 
         feat_columns = None
         if top_k is not None:
@@ -264,12 +269,12 @@ def _load_features_for_mode(
         )
 
     if feature_mode == "vitals":
-        vitals_path = str(config.vitals_features_path(disease))
+        vitals_path = str(base_dir / f"features_vitals__{tag}.parquet" if base_dir else config.vitals_features_path(disease))
         return _read_features(vitals_path)
 
     if feature_mode == "vitals+demo":
-        vitals_path = str(config.vitals_features_path(disease))
-        baseline_path = str(config.baseline_features_path(disease))
+        vitals_path = str(base_dir / f"features_vitals__{tag}.parquet" if base_dir else config.vitals_features_path(disease))
+        baseline_path = str(base_dir / f"features_baseline__{tag}.parquet" if base_dir else config.baseline_features_path(disease))
 
         vitals = _read_features(vitals_path)
         baseline = _read_features(baseline_path)
@@ -310,6 +315,7 @@ class PatientSequenceDataset(Dataset):
         top_k: Optional[int] = None,
         rank_path: Optional[str] = None,
         samples_path: Optional[Union[str, Path]] = None,
+        features_dir: Optional[Union[str, Path]] = None,
     ) -> None:
         super().__init__()
         if split not in {"train", "val", "test"}:
@@ -341,6 +347,7 @@ class PatientSequenceDataset(Dataset):
             feature_mode=feature_mode,
             top_k=top_k,
             rank_path=rank_path,
+            features_dir=features_dir,
         )
 
         _assert_patient_split_consistent(samples)
@@ -352,6 +359,13 @@ class PatientSequenceDataset(Dataset):
         df = df.sort_values(["patientunitstayid", "t_end"]).reset_index(drop=True)
 
         feature_cols = _select_feature_columns(df)
+
+        feature_values = df[feature_cols].to_numpy(dtype=np.float64)
+        if not np.isfinite(feature_values).all():
+            raise ValueError(
+                "Non-finite model features were loaded. Re-run aggregate_features.py so the "
+                "permanent causal_ffill_120m_trainmedian preprocessing is applied before training."
+            )
 
         df = df[df["split"] == split].copy()
         df = df.sort_values(["patientunitstayid", "t_end"]).reset_index(drop=True)

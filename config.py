@@ -45,9 +45,17 @@ LEAD_TIME_MINS = 30
 # Prediction cadence
 STRIDE_MINS = 60
 
-# Horizon for the label window (primary = 4h)
-HORIZON_HRS = 12
+# Final prediction horizon used for model labels.
+HORIZON_HRS = 4
 HORIZON_MINS = HORIZON_HRS * 60
+
+# Conference protocol: first construct and split the fixed 12-hour cohort,
+# limit that intermediate cohort to 10:1, then relabel the retained windows
+# to the final 4-hour horizon and limit them to 5:1.
+FIXED_COHORT_ENABLED = True
+COHORT_HORIZON_HRS = 12
+COHORT_HORIZON_MINS = COHORT_HORIZON_HRS * 60
+COHORT_NEG_POS_MAX_RATIO = 10.0
 
 # Sequence history rules for GRU inputs
 MIN_HISTORY_HRS = 1
@@ -55,7 +63,7 @@ MAX_HISTORY_HRS = 6
 MIN_HISTORY_MINS = MIN_HISTORY_HRS * 60
 MAX_HISTORY_MINS = MAX_HISTORY_HRS * 60
 
-# Pad sequences to this many timesteps (6h max history with 60m stride -> 6 steps)
+# Nominal sequence steps (6h max history with 60m stride -> 6 steps)
 # If you ever change STRIDE_MINS, keep this consistent.
 SEQ_MAX_STEPS = MAX_HISTORY_MINS // STRIDE_MINS
 
@@ -130,7 +138,7 @@ VA_VITAL_COLS = [
 #############################
 # NOTE: Name kept for compatibility, but it now applies to train/val/test.
 NEG_LIMITER_ENABLED = True
-NEG_POS_MAX_RATIO = 10.0
+NEG_POS_MAX_RATIO = 5.0
 NEG_LIMITER_RANDOM_STATE = 42
 
 

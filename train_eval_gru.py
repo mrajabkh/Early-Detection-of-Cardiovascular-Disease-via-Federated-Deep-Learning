@@ -457,8 +457,9 @@ def _save_test_curves(
     disease: config.DiseaseSpec,
     top_k: int | None,
     device: str,
+    output_dir: Path | None = None,
 ) -> Dict[str, str | None]:
-    out_dir = config.run_dir(disease)
+    out_dir = output_dir or config.run_dir(disease)
 
     curves_dir = out_dir / "Curves"
     curves_dir.mkdir(parents=True, exist_ok=True)
@@ -572,8 +573,9 @@ def _save_xai_artifacts(
     threshold: float,
     feature_names: List[str],
     test_pred_df: pd.DataFrame,
+    output_dir: Path | None = None,
 ) -> Dict[str, str]:
-    out_dir = config.run_dir(disease)
+    out_dir = output_dir or config.run_dir(disease)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     run_tag = _run_tag(top_k)
@@ -641,6 +643,8 @@ def train_and_eval(
     top_k: int | None = None,
     rank_path: str | None = None,
     samples_path: str | None = None,
+    features_dir: str | None = None,
+    output_dir: str | None = None,
 ) -> Dict[str, Dict]:
 
     t0 = time.perf_counter()
@@ -655,6 +659,7 @@ def train_and_eval(
             top_k=top_k,
             rank_path=rank_path,
             samples_path=samples_path,
+            features_dir=features_dir,
         )
         val_ds = PatientSequenceDataset(
             split="val",
@@ -665,6 +670,7 @@ def train_and_eval(
             top_k=top_k,
             rank_path=rank_path,
             samples_path=samples_path,
+            features_dir=features_dir,
         )
         test_ds = PatientSequenceDataset(
             split="test",
@@ -675,6 +681,7 @@ def train_and_eval(
             top_k=top_k,
             rank_path=rank_path,
             samples_path=samples_path,
+            features_dir=features_dir,
         )
 
         train_loader = DataLoader(train_ds, cfg.batch_size, True, collate_fn=pad_collate)
@@ -779,6 +786,7 @@ def train_and_eval(
             disease=disease,
             top_k=top_k,
             device=cfg.device,
+            output_dir=Path(output_dir) if output_dir else None,
         )
 
         test_pred_df = _collect_patient_level_predictions(
@@ -796,6 +804,7 @@ def train_and_eval(
             threshold=float(chosen_threshold),
             feature_names=list(train_ds.feature_cols),
             test_pred_df=test_pred_df,
+            output_dir=Path(output_dir) if output_dir else None,
         )
 
         return {

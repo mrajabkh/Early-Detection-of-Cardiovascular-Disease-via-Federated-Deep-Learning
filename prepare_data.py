@@ -266,7 +266,11 @@ def add_patient_level_splits(samples_df: pd.DataFrame) -> pd.DataFrame:
 #############################
 # Neg limiter (config-controlled, per split)
 #############################
-def apply_neg_limiter_from_config(samples_df: pd.DataFrame) -> pd.DataFrame:
+def apply_neg_limiter_from_config(
+    samples_df: pd.DataFrame,
+    max_ratio_override: Optional[float] = None,
+    stage_name: str = "final",
+) -> pd.DataFrame:
     enabled = bool(getattr(config, "NEG_LIMITER_ENABLED", False))
     if not enabled:
         return samples_df
@@ -277,11 +281,15 @@ def apply_neg_limiter_from_config(samples_df: pd.DataFrame) -> pd.DataFrame:
         print("#############################")
         return samples_df
 
-    max_ratio = float(getattr(config, "NEG_POS_MAX_RATIO", 10.0))
+    max_ratio = (
+        float(max_ratio_override)
+        if max_ratio_override is not None
+        else float(getattr(config, "NEG_POS_MAX_RATIO", 10.0))
+    )
     rs = int(getattr(config, "NEG_LIMITER_RANDOM_STATE", getattr(config, "SEED", 42)))
 
     print("#############################")
-    print("Applying neg limiter per split (config-controlled)")
+    print(f"Applying neg limiter per split (stage={stage_name})")
     print("Rule: keep all positives, downsample negatives to Neg <= max_ratio * Pos")
     print(f"NEG_POS_MAX_RATIO: {max_ratio}")
     print(f"NEG_LIMITER_RANDOM_STATE: {rs}")
@@ -329,6 +337,25 @@ def apply_neg_limiter_from_config(samples_df: pd.DataFrame) -> pd.DataFrame:
         out_blocks.append(other)
 
     return pd.concat(out_blocks, axis=0).reset_index(drop=True)
+
+
+def relabel_fixed_cohort(
+    samples_df: pd.DataFrame,
+    horizon_mins: int,
+    lead_time_mins: int,
+) -> pd.DataFrame:
+    """Relabel retained cohort windows without changing their keys or splits."""
+    out = samples_df.copy()
+    t_event = pd.to_numeric(out["t_event"], errors="coerce")
+    t_end = pd.to_numeric(out["t_end"], errors="coerce")
+    lead = t_event - t_end
+    out["label"] = (
+        t_event.notna()
+        & (lead > int(lead_time_mins))
+        & (lead <= int(horizon_mins))
+    ).astype("int64")
+    out["lead_time_mins"] = lead
+    return out
 
 
 #############################
@@ -487,7 +514,13 @@ def main() -> None:
     print("Generating windows")
     print("#############################")
     min_history_mins = int(getattr(config, "MIN_HISTORY_MINS", 60))
-    horizon_mins = int(getattr(config, "HORIZON_MINS", 240))
+    final_horizon_mins = int(getattr(config, "HORIZON_MINS", 240))
+    fixed_cohort_enabled = bool(getattr(config, "FIXED_COHORT_ENABLED", False))
+    cohort_horizon_mins = (
+        int(getattr(config, "COHORT_HORIZON_MINS", final_horizon_mins))
+        if fixed_cohort_enabled
+        else final_horizon_mins
+    )
     stride_mins = int(getattr(config, "STRIDE_MINS", 60))
     lead_time_mins = int(getattr(config, "LEAD_TIME_MINS", 30))
 
@@ -508,7 +541,7 @@ def main() -> None:
             max_offset_vitals=max_off,
             onset_time=onset,
             min_history_mins=min_history_mins,
-            horizon_mins=horizon_mins,
+            horizon_mins=cohort_horizon_mins,
             stride_mins=stride_mins,
             lead_time_mins=lead_time_mins,
             require_full_horizon_for_negatives=require_full_horizon_for_negatives,
@@ -521,7 +554,7 @@ def main() -> None:
     if samples_df.empty:
         raise RuntimeError("No samples were generated. Check disease filter and vitals coverage rules.")
 
-    print_counts(samples_df, "Generated samples (pre-split)")
+    print_counts(samples_df, f"Generated {cohort_horizon_mins // 60}h cohort (pre-split)")
 
     #############################
     # Patient-level split
@@ -532,9 +565,28 @@ def main() -> None:
     samples_df = add_patient_level_splits(samples_df)
 
     #############################
-    # Neg limiter per split (optional, config-controlled)
+    # Reproduce the conference protocol: retain the 12h master cohort at 10:1,
+    # then relabel the same rows to 4h and apply the final 5:1 limiter.
     #############################
-    samples_df = apply_neg_limiter_from_config(samples_df)
+    if fixed_cohort_enabled:
+        cohort_ratio = float(getattr(config, "COHORT_NEG_POS_MAX_RATIO", 10.0))
+        samples_df = apply_neg_limiter_from_config(
+            samples_df,
+            max_ratio_override=cohort_ratio,
+            stage_name="fixed_cohort",
+        )
+        samples_df = relabel_fixed_cohort(
+            samples_df,
+            horizon_mins=final_horizon_mins,
+            lead_time_mins=lead_time_mins,
+        )
+        print_counts(
+            samples_df,
+            f"Fixed cohort relabelled to {final_horizon_mins // 60}h (before final limiter)",
+        )
+        samples_df = apply_neg_limiter_from_config(samples_df, stage_name="final")
+    else:
+        samples_df = apply_neg_limiter_from_config(samples_df, stage_name="final")
 
     #############################
     # Add hospitalid + node_id (shared by centralised + federated)
@@ -566,9 +618,17 @@ def main() -> None:
         "disease": {"major": config.DISEASE.major, "subcategory": config.DISEASE.subcategory},
         "labeling": {
             "type": "horizon",
-            "horizon_mins": int(horizon_mins),
+            "horizon_mins": int(final_horizon_mins),
             "lead_time_mins": int(lead_time_mins),
             "rule": "label=1 iff t_end + lead < onset <= t_end + horizon",
+        },
+        "fixed_cohort": {
+            "enabled": bool(fixed_cohort_enabled),
+            "cohort_horizon_mins": int(cohort_horizon_mins),
+            "cohort_neg_pos_max_ratio": float(
+                getattr(config, "COHORT_NEG_POS_MAX_RATIO", 10.0)
+            ),
+            "procedure": "split 12h cohort, limit to 10:1, relabel to 4h, limit to 5:1",
         },
         "windows": {
             "min_history_mins": int(min_history_mins),

@@ -19,12 +19,18 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+import argparse
 from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 
 import config
+from missing_value_imputation import (
+    classify_feature_columns,
+    impute_from_training_split,
+    save_medians,
+)
 
 
 #############################
@@ -57,13 +63,12 @@ APACHE_BASE_KEEP_COLS = [
     "diabetes",
     "ima",
     "bedcount",
-    "admitsource",
     "graftcount",
 ]
 
-APACHE_BASE_CATEGORICAL_COLS = [
-    "admitsource",
-]
+# APACHE admission-source codes are excluded: patient.py already provides
+# interpretable admission-source fields, making these coded columns redundant.
+APACHE_BASE_CATEGORICAL_COLS: List[str] = []
 
 HX_FEATURES = [
     "hx_hypertension",
@@ -1324,13 +1329,24 @@ def drop_sparse_nonvital_features(
 #############################
 # Main
 #############################
-def main() -> None:
-    data_dir = config.EICU_DATA_DIR
-    samples_csv = config.samples_path(config.DISEASE)
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--samples-path", type=Path, default=None)
+    parser.add_argument("--output-dir", type=Path, default=None)
+    return parser.parse_args()
 
-    out_features_full = config.features_path(config.DISEASE)
-    out_features_vitals = config.vitals_features_path(config.DISEASE)
-    out_features_baseline = config.baseline_features_path(config.DISEASE)
+
+def main() -> None:
+    args = _parse_args()
+    data_dir = config.EICU_DATA_DIR
+    samples_csv = args.samples_path or config.samples_path(config.DISEASE)
+
+    output_dir = args.output_dir or config.run_dir(config.DISEASE)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    disease_tag = config.disease_tag(config.DISEASE)
+    out_features_full = output_dir / f"features__{disease_tag}.parquet"
+    out_features_vitals = output_dir / f"features_vitals__{disease_tag}.parquet"
+    out_features_baseline = output_dir / f"features_baseline__{disease_tag}.parquet"
 
     print("#############################")
     print("Aggregating rolling-window features (memory safe)")
@@ -1596,6 +1612,64 @@ def main() -> None:
     baseline_cols = [c for c in baseline_feats.columns]
     baseline_feats = baseline_feats[baseline_cols].copy()
     baseline_feats = cast_numeric_feature_cols(baseline_feats)
+
+    print("#############################")
+    print("Applying permanent causal missing-value preprocessing")
+    print("Method: <=120-minute within-stay forward fill, then training-split median")
+    print("#############################")
+
+    key_cols = ["patientunitstayid", "t_end"]
+    model_features = vitals_feats.merge(
+        baseline_feats,
+        on=key_cols,
+        how="inner",
+        suffixes=("", "__dup"),
+    )
+    duplicate_cols = [c for c in model_features.columns if c.endswith("__dup")]
+    if duplicate_cols:
+        model_features = model_features.drop(columns=duplicate_cols)
+
+    imputation_input = samples_df[key_cols + ["split"]].merge(
+        model_features,
+        on=key_cols,
+        how="inner",
+    )
+    if len(imputation_input) != len(samples_df):
+        raise RuntimeError(
+            "Cannot permanently impute features because sample/feature keys do not align: "
+            f"samples={len(samples_df)} merged={len(imputation_input)}"
+        )
+
+    model_feature_cols = [c for c in model_features.columns if c not in key_cols]
+    imputed_model_features, training_medians, imputation_stats = impute_from_training_split(
+        imputation_input,
+        model_feature_cols,
+        max_age_mins=120,
+    )
+
+    vitals_feature_cols = [c for c in vitals_feats.columns if c not in key_cols]
+    baseline_feature_cols = [c for c in baseline_feats.columns if c not in key_cols]
+    vitals_feats = imputed_model_features[key_cols + vitals_feature_cols].copy()
+    baseline_feats = imputed_model_features[key_cols + baseline_feature_cols].copy()
+
+    preprocessing_dir = output_dir / "Preprocessing"
+    medians_path = preprocessing_dir / "imputation_medians__causal_ffill_120m_trainmedian.json"
+    save_medians(
+        medians_path,
+        training_medians,
+        max_age_mins=120,
+        categories=classify_feature_columns(model_feature_cols),
+    )
+    handled = imputation_stats["forward_filled"] + imputation_stats["median_filled"]
+    ff_share = 0.0 if handled == 0 else imputation_stats["forward_filled"] / handled
+    print(
+        f"Forward-filled: {imputation_stats['forward_filled']} | "
+        f"Median fallback: {imputation_stats['median_filled']} | "
+        f"Single-observation std set to zero: "
+        f"{imputation_stats['single_observation_std_zeroed']} | "
+        f"Forward-fill share: {ff_share:.2%}"
+    )
+    print(f"Saved fitted training medians: {medians_path}")
 
     print("#############################")
     print("Saving feature parquets")
