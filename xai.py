@@ -28,6 +28,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import random
 from pathlib import Path
@@ -42,6 +43,7 @@ import torch.nn as nn
 import config
 from gru_model import GRURisk
 from sequence_dataset_gru import PatientSequenceDataset
+from trgru_model import TrGRURisk
 
 try:
     import shap
@@ -189,12 +191,19 @@ VARIABLE_TO_GROUP = {
     "Bed count": "Baseline and admission",
     "Heart rate": "Cardiovascular",
     "Systolic blood pressure": "Cardiovascular",
+    "Diastolic blood pressure": "Cardiovascular",
     "Mean arterial pressure": "Cardiovascular",
+    "Central venous pressure": "Cardiovascular",
+    "Arterial systolic pressure": "Cardiovascular",
+    "Arterial diastolic pressure": "Cardiovascular",
+    "Pulmonary artery systolic pressure": "Cardiovascular",
+    "Pulmonary artery diastolic pressure": "Cardiovascular",
     "FiO2": "Respiratory and oxygenation",
     "SpO2": "Respiratory and oxygenation",
     "O2 flow": "Respiratory and oxygenation",
     "PEEP": "Respiratory and oxygenation",
     "Respiratory rate": "Respiratory and oxygenation",
+    "End-tidal CO2": "Respiratory and oxygenation",
     "Temperature": "Temperature",
     "Glasgow Coma Scale": "Neurological",
     "Pain score goal": "Neurological",
@@ -202,6 +211,31 @@ VARIABLE_TO_GROUP = {
     "Cell value numeric": "Labs",
     "Net fluid balance": "Fluids and output",
     "Output total": "Fluids and output",
+}
+
+# Prefix rules make grouping cover every derived statistic belonging to a
+# physiological variable, including min/max/mean/std/count/last and the
+# corresponding missingness indicators. Exact mappings above remain useful
+# for non-family features and human-readable labels.
+FEATURE_PREFIX_TO_VARIABLE = {
+    "vp_heartrate_": "Heart rate",
+    "vp_cvp_": "Central venous pressure",
+    "vp_systemicsystolic_": "Arterial systolic pressure",
+    "vp_systemicdiastolic_": "Arterial diastolic pressure",
+    "vp_systemicmean_": "Mean arterial pressure",
+    "vp_pasystolic_": "Pulmonary artery systolic pressure",
+    "vp_padiastolic_": "Pulmonary artery diastolic pressure",
+    "va_noninvasivesystolic_": "Systolic blood pressure",
+    "va_noninvasivediastolic_": "Diastolic blood pressure",
+    "va_noninvasivemean_": "Mean arterial pressure",
+    "vp_sao2_": "SpO2",
+    "vp_respiration_": "Respiratory rate",
+    "vp_etco2_": "End-tidal CO2",
+    "rch_fio2_": "FiO2",
+    "rch_peep_": "PEEP",
+    "nch_o2_l_": "O2 flow",
+    "vp_temperature_": "Temperature",
+    "nch_temperature_": "Temperature",
 }
 
 
@@ -489,6 +523,7 @@ def _build_global_summary_matrices(
     max_len: int,
     device: str,
     max_patients: Optional[int] = None,
+    batch_size: int = 16,
 ) -> Tuple[np.ndarray, np.ndarray, List[int]]:
     shap_rows: List[np.ndarray] = []
     feature_rows: List[np.ndarray] = []
@@ -496,24 +531,23 @@ def _build_global_summary_matrices(
 
     n = len(test_ds) if max_patients is None else min(len(test_ds), int(max_patients))
 
-    for idx in range(n):
-        x_seq, y_seq, length_t, pid_t = test_ds[idx]
-        length = int(length_t.item())
-        patient_id = int(pid_t.item())
+    if shap is None:
+        raise ImportError(f"The shap package failed to import: {repr(_shap_import_error)}")
+    explainer = shap.GradientExplainer(wrapper, background_x)
 
-        x_pad = _pad_sequence_to_max_len(x_seq.float(), max_len=max_len).unsqueeze(0).to(device)
-        shap_values_tf = _compute_shap_values(
-            wrapper=wrapper,
-            background_x=background_x,
-            patient_x=x_pad,
-        )
+    for start in range(0, n, batch_size):
+        records = [test_ds[idx] for idx in range(start, min(start + batch_size, n))]
+        padded = torch.stack(
+            [_pad_sequence_to_max_len(record[0].float(), max_len=max_len) for record in records]
+        ).to(device)
+        batch_values = _coerce_shap_values(explainer.shap_values(padded))
 
-        shap_row = _aggregate_patient_shap_over_time_signed(shap_values_tf, length)
-        feature_row = _aggregate_patient_feature_values_over_time(x_seq.float(), length)
-
-        shap_rows.append(shap_row)
-        feature_rows.append(feature_row)
-        patient_ids.append(patient_id)
+        for record, shap_values_tf in zip(records, batch_values):
+            x_seq, _, length_t, pid_t = record
+            length = int(length_t.item())
+            shap_rows.append(_aggregate_patient_shap_over_time_signed(shap_values_tf, length))
+            feature_rows.append(_aggregate_patient_feature_values_over_time(x_seq.float(), length))
+            patient_ids.append(int(pid_t.item()))
 
     if not shap_rows:
         raise ValueError("No test patients were available for global SHAP summary generation.")
@@ -545,6 +579,15 @@ def _build_variable_importance_df(feature_ranking_df: pd.DataFrame) -> pd.DataFr
     for _, r in feature_ranking_df.iterrows():
         feature = str(r["feature"])
         variable = FEATURE_TO_VARIABLE.get(feature, None)
+        if variable is None:
+            variable = next(
+                (
+                    mapped_variable
+                    for prefix, mapped_variable in FEATURE_PREFIX_TO_VARIABLE.items()
+                    if feature.startswith(prefix)
+                ),
+                None,
+            )
 
         if variable is None or variable == "EXCLUDE":
             continue
@@ -822,6 +865,7 @@ def _plot_global_shap_beeswarm(
     feature_names: List[str],
     xai_dir: Path,
     top_n: int = 15,
+    model_label: str = "GRU",
 ) -> Path:
     mean_abs = np.abs(global_shap_signed_matrix).mean(axis=0)
     top_idx = np.argsort(mean_abs)[::-1][:top_n]
@@ -844,7 +888,7 @@ def _plot_global_shap_beeswarm(
     axes = fig.axes
     if axes:
         axes[0].set_xlabel("SHAP value")
-        axes[0].set_title("SHAP summary plot for GRU model predictions")
+        axes[0].set_title(f"SHAP summary plot for {model_label} model predictions")
         axes[0].axvline(0, linestyle="--", linewidth=1, color="gray")
     if len(axes) > 1:
         axes[-1].set_ylabel("Feature value (low to high)")
@@ -859,6 +903,7 @@ def _plot_global_shap_bar(
     feature_ranking_df: pd.DataFrame,
     xai_dir: Path,
     top_n: int = 15,
+    model_label: str = "GRU",
 ) -> Path:
     df = feature_ranking_df.head(top_n).iloc[::-1].copy()
     save_path = xai_dir / f"global_shap_bar_top_{top_n}.png"
@@ -867,7 +912,7 @@ def _plot_global_shap_bar(
     plt.barh(df["display_name"], df["mean_abs_shap"])
     plt.xlabel("Mean |SHAP value|")
     plt.ylabel("")
-    plt.title("Global feature importance based on SHAP values (GRU model)")
+    plt.title(f"Global feature importance based on SHAP values ({model_label} model)")
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close()
@@ -948,6 +993,127 @@ def _choose_patient_id(pred_df: pd.DataFrame) -> Optional[int]:
 #############################
 # Main CLI
 #############################
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Generate GRU or TrGRU explanations.")
+    parser.add_argument("--architecture", choices=("gru", "trgru"), default=None)
+    return parser.parse_args()
+
+
+def _architecture_paths(architecture: str, setting: str) -> Tuple[Path, Path]:
+    run_dir = config.run_dir(config.DISEASE)
+    if architecture == "gru":
+        checkpoint = (
+            run_dir / "model__featvitals_demo.pt"
+            if setting == "centralized"
+            else run_dir / "Federated" / "model__fedavg__featvitals_demo.pt"
+        )
+        output = run_dir / "GRU" / "Diagrams" / "SHAP" / setting.capitalize()
+    else:
+        checkpoint = (
+            run_dir / "TrGRU" / "winner_3layer_lr3e4" / "trgru_model.pt"
+            if setting == "centralized"
+            else run_dir / "TrGRU" / "Federated" / "model.pt"
+        )
+        output = run_dir / "TrGRU" / "Diagrams" / "SHAP" / setting.capitalize()
+    return checkpoint, output
+
+
+def _load_architecture_checkpoint(architecture: str, checkpoint: Path, device: str):
+    ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
+    if architecture == "gru":
+        model = _build_model_from_checkpoint(ckpt, device)
+        meta = {
+            "max_len": int(ckpt.get("max_len", 128)),
+            "seed": int(ckpt.get("seed", 42)),
+            "feature_mode": str(ckpt.get("feature_mode", config.FEATURE_MODE)),
+            "top_k": ckpt.get("top_k"),
+            "feature_names": list(ckpt["feature_names"]),
+        }
+        return model, meta
+
+    cfg = ckpt["config"]
+    model = TrGRURisk(
+        input_dim=len(ckpt["feature_names"]),
+        d_model=int(cfg["d_model"]),
+        nhead=int(cfg["nhead"]),
+        transformer_layers=int(cfg["transformer_layers"]),
+        dim_feedforward=int(cfg["dim_feedforward"]),
+        gru_hidden_dim=int(cfg["gru_hidden_dim"]),
+        gru_layers=int(cfg["gru_layers"]),
+        dropout=float(cfg["dropout"]),
+        max_len=int(cfg["max_len"]),
+        mlp_hidden_dim=int(cfg["mlp_hidden_dim"]),
+    ).to(device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+    meta = {
+        "max_len": int(cfg["max_len"]),
+        "seed": int(cfg.get("seed", 42)),
+        "feature_mode": config.FEATURE_MODE,
+        "top_k": None,
+        "feature_names": list(ckpt["feature_names"]),
+    }
+    return model, meta
+
+
+def _run_all_global_explanations(architecture: str, device: str) -> None:
+    label = "GRU" if architecture == "gru" else "TrGRU"
+    for setting in ("centralized", "federated"):
+        checkpoint, output = _architecture_paths(architecture, setting)
+        if not checkpoint.exists():
+            raise FileNotFoundError(checkpoint)
+        output.mkdir(parents=True, exist_ok=True)
+        model, meta = _load_architecture_checkpoint(architecture, checkpoint, device)
+        train_ds = _get_train_dataset(config.DISEASE, meta)
+        test_ds = _get_test_dataset(config.DISEASE, meta)
+        feature_names = list(meta["feature_names"])
+        if list(train_ds.feature_cols) != feature_names or list(test_ds.feature_cols) != feature_names:
+            raise ValueError("Checkpoint and current feature order do not match; refusing invalid SHAP.")
+
+        seed = int(meta["seed"])
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        background = _build_background_tensor(
+            train_ds, int(meta["max_len"]),
+            int(getattr(config, "SHAP_BACKGROUND_SIZE", 64)), seed,
+        ).to(device)
+        wrapper = PatientMaxRiskWrapper(model).to(device).eval()
+        shap_matrix, feature_matrix, patient_ids = _build_global_summary_matrices(
+            wrapper, background, test_ds, int(meta["max_len"]), device,
+            max_patients=None, batch_size=16,
+        )
+        ranking = _rank_features(shap_matrix, feature_names)
+        variables = _build_variable_importance_df(ranking)
+        grouped = _group_shap_importance(variables)
+        ranking.to_csv(output / "global_shap_feature_ranking.csv", index=False)
+        variables.to_csv(output / "variable_shap_importance.csv", index=False)
+        grouped.to_csv(output / "grouped_shap_importance.csv", index=False)
+        pd.DataFrame({"patient_id": patient_ids}).to_csv(
+            output / "shap_patient_ids.csv", index=False
+        )
+        _plot_global_shap_beeswarm(
+            shap_matrix, feature_matrix, feature_names, output, top_n=15,
+            model_label=label,
+        )
+        _plot_grouped_shap_bar(grouped, output)
+        (output / "generation_metadata.json").write_text(
+            json.dumps(
+                {
+                    "architecture": architecture,
+                    "setting": setting,
+                    "checkpoint": str(checkpoint),
+                    "background_size": int(getattr(config, "SHAP_BACKGROUND_SIZE", 64)),
+                    "patients_used": len(patient_ids),
+                    "seed": seed,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        print(f"Saved full-test {label} {setting} SHAP diagrams to: {output}")
+
+
 def main():
     if shap is None:
         raise ImportError(
@@ -957,6 +1123,11 @@ def main():
 
     disease = config.DISEASE
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    args = _parse_args()
+    if args.architecture is not None:
+        _run_all_global_explanations(args.architecture, device)
+        return
 
     model_type = _choose_model_type()
     if model_type is None:
