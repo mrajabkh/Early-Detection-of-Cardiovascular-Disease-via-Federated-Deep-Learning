@@ -57,6 +57,18 @@ COHORT_HORIZON_HRS = 12
 COHORT_HORIZON_MINS = COHORT_HORIZON_HRS * 60
 COHORT_NEG_POS_MAX_RATIO = 10.0
 
+# Non-overlapping time-to-event bins evaluated on the retained fixed cohort.
+# Bounds use (low, high] minutes, matching the main horizon-label convention.
+PREDICTION_HORIZON_BINS = (
+    ("30m_2h", 30, 120),
+    ("2h_4h", 120, 240),
+    ("4h_6h", 240, 360),
+    ("6h_8h", 360, 480),
+    ("8h_10h", 480, 600),
+    ("10h_12h", 600, 720),
+)
+PREDICTION_HORIZON_NEG_POS_MAX_RATIO = 5.0
+
 # Sequence history rules for GRU inputs
 MIN_HISTORY_HRS = 1
 MAX_HISTORY_HRS = 6
@@ -313,6 +325,15 @@ def gru_checkpoint_filename(disease: DiseaseSpec = DISEASE) -> str:
 #############################
 def samples_path(disease: DiseaseSpec = DISEASE) -> Path:
     return run_dir(disease) / samples_filename(disease)
+
+
+def fixed_cohort_samples_path(disease: DiseaseSpec = DISEASE) -> Path:
+    """Fixed 12-hour cohort retained before final-horizon relabelling."""
+    return run_dir(disease) / f"samples__fixed{COHORT_HORIZON_HRS}hcohort__{disease_tag(disease)}.csv"
+
+
+def prediction_horizon_dir(disease: DiseaseSpec = DISEASE) -> Path:
+    return run_dir(disease) / "PredictionHorizon"
 
 
 def features_path(disease: DiseaseSpec = DISEASE) -> Path:

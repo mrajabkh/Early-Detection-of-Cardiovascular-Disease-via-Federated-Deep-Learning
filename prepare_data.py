@@ -568,6 +568,7 @@ def main() -> None:
     # Reproduce the conference protocol: retain the 12h master cohort at 10:1,
     # then relabel the same rows to 4h and apply the final 5:1 limiter.
     #############################
+    fixed_cohort_samples_df: pd.DataFrame | None = None
     if fixed_cohort_enabled:
         cohort_ratio = float(getattr(config, "COHORT_NEG_POS_MAX_RATIO", 10.0))
         samples_df = apply_neg_limiter_from_config(
@@ -575,6 +576,10 @@ def main() -> None:
             max_ratio_override=cohort_ratio,
             stage_name="fixed_cohort",
         )
+        # Persist this exact pre-relabel cohort. Prediction-horizon experiments
+        # must start here: the final 4h limiter can discard windows that become
+        # positive in later, non-overlapping horizon bins.
+        fixed_cohort_samples_df = samples_df.copy()
         samples_df = relabel_fixed_cohort(
             samples_df,
             horizon_mins=final_horizon_mins,
@@ -613,6 +618,10 @@ def main() -> None:
     print("#############################")
     out_samples.parent.mkdir(parents=True, exist_ok=True)
     samples_df.to_csv(out_samples, index=False)
+    fixed_cohort_path = None
+    if fixed_cohort_samples_df is not None:
+        fixed_cohort_path = config.fixed_cohort_samples_path(config.DISEASE)
+        fixed_cohort_samples_df.to_csv(fixed_cohort_path, index=False)
 
     meta = {
         "disease": {"major": config.DISEASE.major, "subcategory": config.DISEASE.subcategory},
@@ -629,6 +638,10 @@ def main() -> None:
                 getattr(config, "COHORT_NEG_POS_MAX_RATIO", 10.0)
             ),
             "procedure": "split 12h cohort, limit to 10:1, relabel to 4h, limit to 5:1",
+            "samples_file": None if fixed_cohort_path is None else fixed_cohort_path.name,
+            "retained_windows": (
+                None if fixed_cohort_samples_df is None else int(len(fixed_cohort_samples_df))
+            ),
         },
         "windows": {
             "min_history_mins": int(min_history_mins),
@@ -674,6 +687,8 @@ def main() -> None:
 
     print("Done.")
     print(f"Saved samples: {out_samples}")
+    if fixed_cohort_path is not None:
+        print(f"Saved fixed cohort: {fixed_cohort_path}")
     print(f"Saved meta: {out_meta}")
 
 

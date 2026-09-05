@@ -1010,7 +1010,7 @@ def _architecture_paths(architecture: str, setting: str) -> Tuple[Path, Path]:
         output = run_dir / "GRU" / "Diagrams" / "SHAP" / setting.capitalize()
     else:
         checkpoint = (
-            run_dir / "TrGRU" / "winner_3layer_lr3e4" / "trgru_model.pt"
+            run_dir / "TrGRU" / "Centralized" / "trgru_model.pt"
             if setting == "centralized"
             else run_dir / "TrGRU" / "Federated" / "model.pt"
         )

@@ -1,4 +1,4 @@
-"""Federated FedProx training for the adapted TrGRU model.
+"""Federated FedAvg/FedProx training for the adapted TrGRU model.
 
 The run is resumable after every completed communication round. Test data are
 evaluated only after all rounds finish and the best validation state is loaded.
@@ -35,11 +35,17 @@ from trgru_model import TrGRURisk
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run federated TrGRU with FedProx.")
+    parser = argparse.ArgumentParser(description="Run federated TrGRU with FedAvg/FedProx.")
     parser.add_argument("--rounds", type=int, default=30)
     parser.add_argument("--local-epochs", type=int, default=1)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--mu", type=float, default=0.01)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Optional isolated output directory (default: the main Federated folder).",
+    )
     parser.add_argument("--no-resume", action="store_true")
     return parser.parse_args()
 
@@ -97,14 +103,51 @@ def _train_client(
             optimizer.zero_grad()
             logits = model(x, lengths)["logits_ts"]
             task_loss = masked_focal_loss(logits, y, mask, gamma=2.0, pos_weight=pos_weight)
-            proximal_penalty = sum(
-                torch.sum((parameter - global_parameters[name]) ** 2)
-                for name, parameter in model.named_parameters()
-            )
-            loss = task_loss + 0.5 * float(mu) * proximal_penalty
+            if np.isclose(mu, 0.0):
+                loss = task_loss
+            else:
+                proximal_penalty = sum(
+                    torch.sum((parameter - global_parameters[name]) ** 2)
+                    for name, parameter in model.named_parameters()
+                )
+                loss = task_loss + 0.5 * float(mu) * proximal_penalty
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+
+
+def _save_federated_auprc_plot(history: list[dict[str, float]], out_dir: Path) -> None:
+    history_df = pd.DataFrame(history)
+    required = {"round", "val_auprc"}
+    if not required.issubset(history_df.columns):
+        raise ValueError("Federated history must contain round and val_auprc")
+    if not np.isfinite(history_df[list(required)].to_numpy(dtype=float)).all():
+        raise ValueError("Federated AUPRC history contains non-finite values")
+    diagrams_dir = (
+        out_dir.parent / "Diagrams" / "Federated"
+        if out_dir.name == "Federated"
+        else out_dir / "Diagrams"
+    )
+    diagrams_dir.mkdir(parents=True, exist_ok=True)
+    central_results = config.run_dir(config.DISEASE) / "TrGRU" / "Centralized" / "trgru_results.csv"
+    plt.figure(figsize=(7, 5))
+    plt.plot(history_df["round"], history_df["val_auprc"], marker="o", linewidth=2,
+             label="Federated (validation)")
+    if central_results.exists():
+        baseline = float(pd.read_csv(central_results).iloc[0]["val_auprc"])
+        plt.axhline(baseline, color="gray", linestyle="--", linewidth=1.5,
+                    label="Centralised baseline (validation)")
+    plt.xlabel("Federated round")
+    plt.ylabel("AUPRC")
+    plt.title("Validation AUPRC across communication rounds")
+    plt.ylim(0.0, 1.0)
+    plt.grid(alpha=0.3)
+    plt.legend(loc="best")
+    plt.tight_layout()
+    path = diagrams_dir / "federated_validation_auprc.png"
+    plt.savefig(path, dpi=200)
+    plt.close()
+    print(f"Saved federated TrGRU AUPRC diagram to: {path}")
 
 
 def _save_federated_plots(history: list[dict[str, float]], out_dir: Path) -> None:
@@ -114,9 +157,18 @@ def _save_federated_plots(history: list[dict[str, float]], out_dir: Path) -> Non
     if missing:
         raise ValueError(f"Federated history is missing plot columns: {sorted(missing)}")
 
-    diagrams_dir = out_dir.parent / "Diagrams" / "Federated"
+    diagrams_dir = (
+        out_dir.parent / "Diagrams" / "Federated"
+        if out_dir.name == "Federated"
+        else out_dir / "Diagrams"
+    )
     diagrams_dir.mkdir(parents=True, exist_ok=True)
-    central_results = out_dir.parent / "winner_3layer_lr3e4" / "trgru_results.csv"
+    central_results = (
+        config.run_dir(config.DISEASE)
+        / "TrGRU"
+        / "Centralized"
+        / "trgru_results.csv"
+    )
     central_auroc = None
     if central_results.exists():
         central_auroc = float(pd.read_csv(central_results).iloc[0]["test_auroc"])
@@ -146,6 +198,7 @@ def _save_federated_plots(history: list[dict[str, float]], out_dir: Path) -> Non
     plt.tight_layout()
     plt.savefig(diagrams_dir / "federated_validation_loss.png", dpi=200)
     plt.close()
+    _save_federated_auprc_plot(history, out_dir)
     print(f"Saved federated TrGRU diagrams to: {diagrams_dir}")
 
 
@@ -153,11 +206,16 @@ def main() -> None:
     args = _parse_args()
     if args.mu < 0:
         raise ValueError("--mu must be non-negative")
+    algorithm = "fedavg" if np.isclose(args.mu, 0.0) else "fedprox"
     cfg = TrGRUConfig(lr=args.lr, epochs=1, patience=1)
     _seed(cfg.seed)
 
     samples_path = config.samples_path(config.DISEASE)
-    out_dir = config.run_dir(config.DISEASE) / "TrGRU" / "Federated"
+    out_dir = (
+        args.output_dir.resolve()
+        if args.output_dir is not None
+        else config.run_dir(config.DISEASE) / "TrGRU" / "Federated"
+    )
     node_dir = out_dir / "nodes"
     out_dir.mkdir(parents=True, exist_ok=True)
     node_ids, node_paths, node_sizes = _write_node_samples_csvs(samples_path, node_dir)
@@ -175,11 +233,11 @@ def main() -> None:
     history: list[dict[str, float]] = []
     if resume_path.exists() and not args.no_resume:
         saved = torch.load(resume_path, map_location="cpu", weights_only=False)
-        if saved.get("algorithm") != "fedprox" or not np.isclose(
+        if saved.get("algorithm") != algorithm or not np.isclose(
             float(saved.get("mu", np.nan)), float(args.mu)
         ):
             raise ValueError(
-                "The existing resume checkpoint is not from this FedProx configuration. "
+                "The existing resume checkpoint is not from this federated configuration. "
                 "Delete the federated output folder or rerun with --no-resume."
             )
         global_model.load_state_dict(saved["global_state"])
@@ -232,7 +290,7 @@ def main() -> None:
 
         torch.save(
             {
-                "algorithm": "fedprox",
+                "algorithm": algorithm,
                 "mu": float(args.mu),
                 "completed_round": round_index + 1,
                 "global_state": global_model.state_dict(),
@@ -259,8 +317,8 @@ def main() -> None:
     test.update(_threshold_metrics(test_y, test_prob, threshold))
 
     result = {
-        "model": "fedprox_trgru",
-        "algorithm": "fedprox",
+        "model": f"{algorithm}_trgru",
+        "algorithm": algorithm,
         "mu": float(args.mu),
         "n_features": len(val_ds.feature_cols),
         "n_nodes": len(node_ids),
@@ -290,8 +348,8 @@ def main() -> None:
             "config": asdict(cfg),
             "feature_names": val_ds.feature_cols,
             "threshold": threshold,
-            "model_type": "fedprox_trgru",
-            "algorithm": "fedprox",
+            "model_type": f"{algorithm}_trgru",
+            "algorithm": algorithm,
             "mu": float(args.mu),
         },
         out_dir / "model.pt",

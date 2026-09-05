@@ -50,7 +50,6 @@ class TrGRUConfig:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the adapted TrGRU model.")
-    parser.add_argument("--run-name", default="winner_3layer_lr3e4")
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--nhead", type=int, default=4)
     parser.add_argument("--transformer-layers", type=int, default=3)
@@ -176,7 +175,7 @@ def main() -> None:
         test_y, test_prob = _flatten_loader_probs(model, loaders["test"], cfg.device)
         test.update(_threshold_metrics(test_y, test_prob, threshold))
 
-    out_dir = config.run_dir(config.DISEASE) / "TrGRU" / args.run_name
+    out_dir = config.run_dir(config.DISEASE) / "TrGRU" / "Centralized"
     out_dir.mkdir(parents=True, exist_ok=True)
     result = {
         "model": "TrGRU adapted replication",
